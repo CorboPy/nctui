@@ -177,7 +177,7 @@ async def test_save_png(app, tmp_path):
         out = tmp_path / "out.png"
         app.screen.query_one("#file").value = str(out)
         await pilot.press("enter")
-        for _ in range(100):
+        for _ in range(600):  # up to 30 s: a fresh CI runner can be slow to draw the first figure
             if out.exists() and not isinstance(app.screen, SaveScreen):
                 break
             await pilot.pause(0.05)
@@ -243,6 +243,31 @@ async def test_save_dialog_animation_format_choice(app, monkeypatch):
         screen.query_one("#what").query("RadioButton")[0].value = True  # back to a plot
         await pilot.pause()
         assert file.value == "movie.png"
+
+
+async def test_save_dialog_format_ignores_a_stale_file_name_event(app, monkeypatch):
+    """Two file-name changes queued before either is handled: the older one must not
+    switch the format. (Without ffmpeg this is what happens when you choose animation:
+    the default .gif name is set, then the chosen format's extension replaces it.)"""
+    import nctui.screens.save as save
+
+    monkeypatch.setattr(save, "can_write_video", lambda: True)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("e")
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#what").query("RadioButton")[1].value = True
+        await pilot.pause()
+        fmt, file = screen.query_one("#format"), screen.query_one("#file")
+        assert fmt.pressed_index == 0  # mp4
+        file.value = "movie.gif"  # queued, then overtaken before it is handled
+        file.value = "movie.mp4"
+        await pilot.pause()
+        assert fmt.pressed_index == 0 and file.value == "movie.mp4"
+        await pilot.click(fmt.query("RadioButton")[1])  # and choosing gif sticks
+        await pilot.pause()
+        assert fmt.pressed_index == 1 and file.value == "movie.gif"
 
 
 async def test_save_dialog_choice_stays_visible_and_works_by_keyboard_and_mouse(app):
@@ -327,11 +352,12 @@ async def test_animation_advances_time(app):
         await settle(pilot, app)
         await pilot.press("greater_than_sign", "greater_than_sign", "greater_than_sign")  # 20 fps
         await pilot.press("space")
-        await pilot.pause(0.6)
+        # watch the steps go by: where it stops says nothing, as 4 steps wrap round to 0
+        seen = {app.viewer.pos("time")}
+        assert await wait_for(pilot, lambda: seen.add(app.viewer.pos("time")) or len(seen) >= 3, tries=200)
         await pilot.press("space")
         await settle(pilot, app)
         assert app._anim_timer is None
-        assert app.viewer.pos("time") != 0 or app.last_frame.request.index_dict()["time"] != 0
 
 
 async def test_playback_waits_for_a_slow_terminal_and_says_how_fast_it_really_is(app):

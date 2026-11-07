@@ -11,6 +11,13 @@ import xarray as xr
 EXAMPLE_DATA = Path(__file__).resolve().parent.parent / "example_data"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _matplotlib_font_cache():
+    """Build matplotlib's font cache before any timed test: on a fresh CI runner the first
+    figure can take many seconds while it scans the system fonts."""
+    import matplotlib.font_manager  # noqa: F401  (importing builds the cache)
+
+
 def make_cartesian(path: Path, nt=4, nz=6, ny=5, nx=7, t0=0.0, calendar="standard") -> Path:
     """A 4-D t/z/y/x file shaped like the LFRic examples, plus a half-level variable."""
     t = t0 + np.arange(nt) * 1800.0

@@ -191,7 +191,9 @@ class SaveScreen(ModalScreen[None]):
         event.stop()
         if event.input.id != "file" or not self.anim:
             return
-        ext = os.path.splitext(event.value)[1].lower()
+        # the box's value now, not the event's: a change queued before the format was
+        # picked must not switch the format back
+        ext = os.path.splitext(event.input.value)[1].lower()
         if ext in ANIM_FORMATS:
             button = self.query_one("#format", RadioSet).query(RadioButton)[ANIM_FORMATS.index(ext)]
             if not button.value and not button.disabled:
