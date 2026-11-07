@@ -1,0 +1,46 @@
+# Lint and test nctui on every pull request and every push to main.
+# The job names ("lint", "tests (ubuntu-latest)", "tests (macos-latest)") are what
+# you pick as required checks in the branch rules on GitHub.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# a newer push to the same pull request cancels the older run
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.55.0
+          locked: true  # fail if pixi.lock doesn't match pyproject.toml
+          cache: true
+      - run: pixi run lint
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        # the two platforms in pixi.lock: Linux (HPC) and Apple-silicon Macs
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.55.0
+          locked: true
+          cache: true
+      # tests that need example_data/ or ffmpeg skip themselves when those are missing
+      - run: pixi run test
