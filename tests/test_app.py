@@ -245,6 +245,31 @@ async def test_save_dialog_animation_format_choice(app, monkeypatch):
         assert file.value == "movie.png"
 
 
+async def test_save_dialog_format_ignores_a_stale_file_name_event(app, monkeypatch):
+    """Two file-name changes queued before either is handled: the older one must not
+    switch the format. (Without ffmpeg this is what happens when you choose animation:
+    the default .gif name is set, then the chosen format's extension replaces it.)"""
+    import nctui.screens.save as save
+
+    monkeypatch.setattr(save, "can_write_video", lambda: True)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("e")
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#what").query("RadioButton")[1].value = True
+        await pilot.pause()
+        fmt, file = screen.query_one("#format"), screen.query_one("#file")
+        assert fmt.pressed_index == 0  # mp4
+        file.value = "movie.gif"  # queued, then overtaken before it is handled
+        file.value = "movie.mp4"
+        await pilot.pause()
+        assert fmt.pressed_index == 0 and file.value == "movie.mp4"
+        await pilot.click(fmt.query("RadioButton")[1])  # and choosing gif sticks
+        await pilot.pause()
+        assert fmt.pressed_index == 1 and file.value == "movie.gif"
+
+
 async def test_save_dialog_choice_stays_visible_and_works_by_keyboard_and_mouse(app):
     async with app.run_test(size=SIZE) as pilot:
         await settle(pilot, app)
