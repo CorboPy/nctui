@@ -177,7 +177,7 @@ async def test_save_png(app, tmp_path):
         out = tmp_path / "out.png"
         app.screen.query_one("#file").value = str(out)
         await pilot.press("enter")
-        for _ in range(100):
+        for _ in range(600):  # up to 30 s: a fresh CI runner can be slow to draw the first figure
             if out.exists() and not isinstance(app.screen, SaveScreen):
                 break
             await pilot.pause(0.05)
