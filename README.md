@@ -3,8 +3,7 @@
 A fast terminal viewer for weather and climate model netCDF output. Open a file and
 you get a plot straight away. Flick through variables, times and levels from the
 keyboard (or the mouse), probe values, pull out vertical profiles and time series,
-and save a PNG, all without leaving the terminal. It works the same in a local
-terminal and over SSH on an HPC login node.
+and save a PNG, all without leaving the terminal.
 
 ```
 nctui run_output.nc
@@ -96,13 +95,6 @@ so the UK is no longer split across the edges. The x and y of a Cartesian grid a
 taken to be periodic (as bi-periodic model domains are), so they can be centred the
 same way.
 
-Latitude wraps the same way when the grid reaches both poles: the north pole is
-followed by the south pole. Centred on 90, the rows run 0 … 90 in the middle, then
-on with -90 … 0, and the tick where the poles meet reads ±90. Every row keeps the
-longitudes on the x axis, including any longitude centring. In the enter menu,
-*Centre here: longitude* leaves latitude alone; *Centre here: longitude + latitude*
-wraps both.
-
 ### Saving a figure or an animation
 
 Get the plot looking the way you want, then press `e`. The dialog is filled in
@@ -111,8 +103,7 @@ is drawn by matplotlib with your colour map, range, view, zoom and coastlines, u
 **every data point**, not the reduced version on screen. Name the file `.pdf` or
 `.svg` for those formats.
 
-Choose *animation* in the same dialog (it starts there if an animation is playing)
-to save every step along the animated dimension as a movie, at your playback speed.
+Choose *animation* in the same dialog to save every step along the animated dimension as a movie, at your playback speed.
 You can pick the first and last frame and the frame rate. Each frame's title gets
 its own time (or level). Pick *mp4* or *gif* under *format* (or just type the
 file name's extension). mp4 needs `ffmpeg` on your `PATH`; gif always works.
@@ -123,8 +114,8 @@ choose *min/max: fit animation* in the colours popup first.
 
 A terminal cell holds two roughly square pixels (nctui draws with the `▀` character
 in two colours), so a full-screen laptop terminal gives the plot about 180 × 100
-pixels. That's enough for most horizontal maps, but a 300-level section has more
-levels than the screen has pixel rows. nctui handles this as follows:
+pixels. However, if there are more
+levels than the screen has pixel rows, nctui handles this as follows:
 
 - The status line under the plot always shows how the data was fitted:
   `full_levels 301→104 ÷2.9 (mean)` means about three levels share each pixel row;
@@ -170,8 +161,6 @@ pixi run lint
 - `frame.py` ties them together off the UI thread.
 - `app.py`, `widgets/` and `screens/` make up the Textual UI.
 
-The design is in [docs/specs/2026-11-06-nctui-design.md](docs/specs/2026-11-06-nctui-design.md).
-
 `scripts/build_colormaps.py` regenerates the colour-map tables from matplotlib, and
 `scripts/build_coastlines.py` rebuilds the bundled coastline file from Natural
 Earth's `ne_110m_coastline.zip`.
@@ -179,7 +168,7 @@ Earth's `ne_110m_coastline.zip`.
 ## Data credits
 
 Coastlines are from [Natural Earth](https://www.naturalearthdata.com/) (public
-domain). The colour maps come from matplotlib.
+domain). The colour maps come from [matplotlib](https://matplotlib.org/stable/gallery/color/colormap_reference.html).
 
 ## Licence
 
