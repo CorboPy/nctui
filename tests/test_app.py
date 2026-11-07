@@ -352,11 +352,12 @@ async def test_animation_advances_time(app):
         await settle(pilot, app)
         await pilot.press("greater_than_sign", "greater_than_sign", "greater_than_sign")  # 20 fps
         await pilot.press("space")
-        await pilot.pause(0.6)
+        # watch the steps go by: where it stops says nothing, as 4 steps wrap round to 0
+        seen = {app.viewer.pos("time")}
+        assert await wait_for(pilot, lambda: seen.add(app.viewer.pos("time")) or len(seen) >= 3, tries=200)
         await pilot.press("space")
         await settle(pilot, app)
         assert app._anim_timer is None
-        assert app.viewer.pos("time") != 0 or app.last_frame.request.index_dict()["time"] != 0
 
 
 async def test_playback_waits_for_a_slow_terminal_and_says_how_fast_it_really_is(app):
