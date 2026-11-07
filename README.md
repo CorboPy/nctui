@@ -9,6 +9,9 @@ and save a PNG, all without leaving the terminal.
 nctui run_output.nc
 ```
 
+<img width="1512" height="826" alt="nctui_display" src="https://github.com/user-attachments/assets/7c182c15-1d48-4621-8790-267dfc0d4dc1" />
+
+
 ## Install
 
 nctui uses [pixi](https://pixi.sh). The environment builds on macOS (Apple
