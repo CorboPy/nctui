@@ -127,7 +127,7 @@ class DimensionPanel(Widget, can_focus=True):
             if viewer.step(d, delta * viewer.probe_step(d)):
                 self.nctui.view_changed()
             return
-        if viewer.step(d, delta):
+        if viewer.step(d, delta, wrap=True):  # ◀ on the first step goes to the last
             self.nctui.view_changed()
 
     def action_jump(self, where: int) -> None:

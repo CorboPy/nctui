@@ -105,7 +105,7 @@ HELP = [
     ("Slicing", [
         ("[ ]", "step time back / forward"),
         ("{ }", "step the vertical level down / up"),
-        ("← →", "Dimensions: step the highlighted dimension (shift = ×10, home/end)"),
+        ("← →", "Dimensions: step the highlighted dimension, wrapping round (shift = ×10, home/end)"),
         ("x  y", "Dimensions: put the highlighted dimension on the x or y axis"),
         ("v", "cycle views: map → section (z–x) → section (z–y)"),
         ("t", "swap the plot axes"),

@@ -435,6 +435,32 @@ async def test_dimension_panel_keys(app):
         assert app.viewer.ydim == "full_levels"
 
 
+async def test_dimension_panel_steps_wrap_round(app):
+    """← on the first step goes to the last, → on the last back to the first (4 times, 6 levels)."""
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("tab")  # Variables → Dimensions, cursor on time
+        assert app.viewer.pos("time") == 0
+        await pilot.press("left")
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 3
+        await pilot.press("right")
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 0
+        await pilot.press("down", "left")  # full_levels 0 → 5
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 5
+        assert app.last_frame.request.index_dict()["full_levels"] == 5
+
+
+async def test_bracket_keys_still_stop_at_the_ends(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("left_square_bracket")
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 0
+
+
 async def test_latlon_coastlines_toggle(latlon):
     app = NctuiApp(Source(latlon), "air_temperature")
     async with app.run_test(size=SIZE) as pilot:
