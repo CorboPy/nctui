@@ -103,9 +103,9 @@ HELP = [
         ("esc", "close a popup, or go back from a line plot to the map"),
     ]),
     ("Slicing", [
-        ("[ ]", "step time back / forward"),
-        ("{ }", "step the vertical level down / up"),
-        ("← →", "Dimensions: step the highlighted dimension (shift = ×10, home/end)"),
+        ("[ ]", "step time back / forward (wraps round)"),
+        ("{ }", "step the vertical level down / up (wraps round)"),
+        ("← →", "Dimensions: step the highlighted dimension, wrapping round (shift = ×10, home/end)"),
         ("x  y", "Dimensions: put the highlighted dimension on the x or y axis"),
         ("v", "cycle views: map → section (z–x) → section (z–y)"),
         ("t", "swap the plot axes"),

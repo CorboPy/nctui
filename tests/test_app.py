@@ -435,6 +435,51 @@ async def test_dimension_panel_keys(app):
         assert app.viewer.ydim == "full_levels"
 
 
+async def test_dimension_panel_steps_wrap_round(app):
+    """← on the first step goes to the last, → on the last back to the first (4 times, 6 levels)."""
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("tab")  # Variables → Dimensions, cursor on time
+        assert app.viewer.pos("time") == 0
+        await pilot.press("left")
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 3
+        await pilot.press("right")
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 0
+        await pilot.press("down", "left")  # full_levels 0 → 5
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 5
+        assert app.last_frame.request.index_dict()["full_levels"] == 5
+
+
+async def test_bracket_keys_wrap_round(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("left_square_bracket")  # time 0 → 3
+        await settle(pilot, app)
+        assert app.viewer.pos("time") == 3
+        await pilot.press("left_curly_bracket")  # full_levels 0 → 5
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 5
+        await pilot.press("right_curly_bracket")  # and back to 0
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 0
+
+
+async def test_dimension_panel_probe_wraps_round_a_plotted_dimension(app):
+    """x has 7 points and the probe starts at 3: four steps right go round to 0."""
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("tab")
+        dims = app.query_one("#dims")
+        dims.cursor = dims.dims().index("projection_x_coordinate")
+        assert app.viewer.pos("projection_x_coordinate") == 3
+        await pilot.press("right", "right", "right", "right")
+        await settle(pilot, app)
+        assert app.viewer.pos("projection_x_coordinate") == 0
+
+
 async def test_latlon_coastlines_toggle(latlon):
     app = NctuiApp(Source(latlon), "air_temperature")
     async with app.run_test(size=SIZE) as pilot:

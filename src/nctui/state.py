@@ -153,10 +153,14 @@ class Viewer:
             self._keep_in_window(dim, i)
         return changed
 
-    def step(self, dim: str | None, delta: int) -> bool:
+    def step(self, dim: str | None, delta: int, wrap: bool = False) -> bool:
+        """Move ``dim`` by ``delta``; ``wrap`` goes round from the last step to the first."""
         if dim is None:
             return False
-        return self.set_pos(dim, self.pos(dim) + delta)
+        i = self.pos(dim) + delta
+        if wrap:
+            i %= self.src.dims[dim].size
+        return self.set_pos(dim, i)
 
     def step_targets(self) -> tuple[str | None, str | None]:
         """The dimensions that ``[ ]`` and ``{ }`` step."""

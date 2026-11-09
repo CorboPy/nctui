@@ -43,7 +43,9 @@ The screen has three panes. Move between them with `tab`, or click.
   highlight plots that variable straight away. `/` searches by name, long_name or
   standard_name.
 - **Dimensions** (left, bottom): where you are along each dimension. `←→` steps
-  the highlighted one, and `x` / `y` put it on the plot's axes.
+  the highlighted one, wrapping round from the last step to the first (on a plotted
+  dimension it moves the probe, also wrapping round), and `x` / `y` put it on the
+  plot's axes.
 - **Plot** (right): one plot at a time. The arrow keys move a probe that reads out the
   value at that grid point. `enter` opens the vertical profile, time series or a line
   through the probe; `esc` goes back.
@@ -56,8 +58,8 @@ view.
 
 | Key | Action |
 |---|---|
-| `[` `]` | step time |
-| `{` `}` | step the vertical level |
+| `[` `]` | step time (wraps round from the last step to the first) |
+| `{` `}` | step the vertical level (wraps round) |
 | `v` | cycle views: map → section (z–x) → section (z–y) |
 | `t` | swap the plot axes |
 | `space`, `<` `>` | play / pause animation, slower / faster |
