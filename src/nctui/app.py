@@ -348,12 +348,12 @@ class NctuiApp(App):
 
     def action_step_a(self, delta: int) -> None:
         a, _ = self.viewer.step_targets()
-        if self.viewer.step(a, delta):
+        if self.viewer.step(a, delta, wrap=True):
             self.view_changed()
 
     def action_step_b(self, delta: int) -> None:
         _, b = self.viewer.step_targets()
-        if self.viewer.step(b, delta):
+        if self.viewer.step(b, delta, wrap=True):
             self.view_changed()
 
     def action_cycle_view(self) -> None:

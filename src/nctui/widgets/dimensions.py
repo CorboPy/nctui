@@ -124,7 +124,7 @@ class DimensionPanel(Widget, can_focus=True):
         viewer = self.nctui.viewer
         if d in viewer.plotted():
             # stepping a plotted dimension moves the probe along it
-            if viewer.step(d, delta * viewer.probe_step(d)):
+            if viewer.step(d, delta * viewer.probe_step(d), wrap=True):
                 self.nctui.view_changed()
             return
         if viewer.step(d, delta, wrap=True):  # ◀ on the first step goes to the last
