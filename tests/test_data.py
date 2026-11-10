@@ -199,28 +199,38 @@ def test_centring_wraps_longitude_round(latlon):
     np.testing.assert_array_equal(src.read("air_temperature", {"time": 1, "level_height": 2}), before)
 
 
-def test_latitude_wraps_from_pole_to_pole(latlon):
-    """Latitude -80..80 every 20°. Centred on 90 it wraps like longitude: 0 … 80 in the
-    north, then on into the south (-80 … -20), with the poles meeting in the middle."""
+def test_latitude_is_mirrored_at_the_poles(latlon):
+    """Latitude -80..80 every 20°. Centred on 90: from the south pole up to the north
+    pole in the middle, then mirrored back down to the south pole, same longitudes."""
     src = Source(latlon)
     before = np.array(src.read("air_temperature", {"time": 1, "level_height": 2}))
-    assert src.period("latitude") == 180.0
+    assert src.period("latitude") == 360.0
     src.set_centre("latitude", 90.0)
     lat = src.dims["latitude"]
-    np.testing.assert_array_equal(lat.values, [0, 20, 40, 60, 80, 100, 120, 140, 160])
-    assert [lat.label(i) for i in range(9)] == ["0", "20", "40", "60", "80", "-80", "-60", "-40", "-20"]
-    assert lat.tick_label(90.0) == "±90" and lat.tick_label(120.0) == "-60"
+    assert lat.size == 18  # every row twice
+    np.testing.assert_array_equal(lat.values, np.arange(-80, 261, 20))
+    assert [lat.label(i) for i in (0, 8, 9, 17)] == ["-80", "80", "80", "-80"]
+    assert lat.tick_label(90.0) == "90" and lat.tick_label(120.0) == "60"
     after = src.read("air_temperature", {"time": 1, "level_height": 2})
-    np.testing.assert_array_equal(after, np.roll(before, -4, axis=0))  # same longitudes on every row
-    window = src.read("air_temperature", {"time": 1, "level_height": 2, "latitude": (3, 7), "longitude": (2, 5)})
-    np.testing.assert_array_equal(window, after[3:7, 2:5])
-    assert lat.nearest(-60.0) == 6
+    np.testing.assert_array_equal(after, np.concatenate([before, before[::-1]]))  # a mirror, same longitudes
+    window = src.read("air_temperature", {"time": 1, "level_height": 2, "latitude": (6, 12), "longitude": (2, 5)})
+    np.testing.assert_array_equal(window, after[6:12, 2:5])
+    np.testing.assert_array_equal(src.read("air_temperature", {"time": 1, "level_height": 2, "latitude": 13}),
+                                  after[13])
+    # centred on -90 the mirror is about the south pole: north pole at the bottom and the top
+    src.set_centre("latitude", -90.0)
+    np.testing.assert_array_equal(src.dims["latitude"].values, np.arange(-260, 81, 20))
+    np.testing.assert_array_equal(src.read("air_temperature", {"time": 1, "level_height": 2}),
+                                  np.concatenate([before[::-1], before]))
     # longitude centred as well
     src.set_centre("longitude", 0.0)
     np.testing.assert_array_equal(src.read("air_temperature", {"time": 1, "level_height": 2}),
-                                  np.roll(after, -src.roll("longitude"), axis=1))
+                                  np.roll(np.concatenate([before[::-1], before]), -src.roll("longitude"), axis=1))
+    with pytest.raises(ValueError):
+        src.set_centre("latitude", 100.0)
     src.set_centre("latitude", None)
     src.set_centre("longitude", None)
+    assert src.dims["latitude"].size == 9
     np.testing.assert_array_equal(src.read("air_temperature", {"time": 1, "level_height": 2}), before)
 
 
@@ -232,7 +242,7 @@ def test_latitude_only_wraps_from_pole_to_pole(tmp_path):
 
 
 def test_latitude_with_points_on_the_poles_labels_each_pole_row():
-    """A 90..-90 grid has a north and a south pole row; centred on 90 they sit side by side."""
+    """A grid that reaches both poles can be centred; one that stops short can't."""
     from nctui.data import _pole_to_pole
 
     assert _pole_to_pole(np.arange(90.0, -90.5, -1.0))
@@ -243,3 +253,12 @@ def test_cartesian_x_and_y_count_as_periodic(cartesian):
     src = Source(cartesian)
     assert src.period("projection_x_coordinate") == 700.0
     assert src.period("full_levels") is None
+
+
+def test_mirror_layout_keeps_one_copy_of_a_row_on_the_pole():
+    from nctui.data import _mirror_layout, fold_latitude
+
+    u, rows = _mirror_layout(np.arange(90.0, -90.5, -30.0), 90.0)  # 90 … -90, descending
+    assert len(u) == 12 and list(u).count(90.0) == 1 and list(u).count(-90.0) == 1
+    assert np.all(np.diff(u) == -30.0)
+    assert fold_latitude(100.0) == 80.0 and fold_latitude(-100.0) == -80.0 and fold_latitude(45.0) == 45.0

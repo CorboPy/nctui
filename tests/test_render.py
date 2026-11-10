@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 
 from nctui import coastlines
@@ -171,26 +173,28 @@ def test_degree_ticks_land_on_the_pole_and_equator():
     assert degree_ticks(50.2, 50.3, 4) == nice_ticks(50.2, 50.3, 4)
 
 
-def test_wrapped_latitude_keeps_the_longitudes_and_marks_the_seam(latlon):
+def test_mirrored_latitude_keeps_the_longitudes(latlon):
     v = Viewer(Source(latlon))
     v.select_var("air_temperature")
     v.centre_on("longitude", 0.0)
-    plain = build_frame(v.src, v.request(), 100, 30)
+    plain = build_frame(v.src, v.request(), 100, 40)
     v.centre_on("latitude", 90.0)
     v.options.coastlines = True
-    f = build_frame(v.src, v.request(), 100, 30)
+    f = build_frame(v.src, v.request(), 100, 40)
+    assert f.error is None and f.maps["latitude"].n == 18
     text = ["".join(s.text for s in line) for line in f.lines]
     assert text[-2] == "".join(s.text for s in plain.lines[-2])  # the same longitude labels
-    assert "±90" in "".join(text[f.image_row:f.image_row + 20])  # where the poles meet
+    rows = text[f.image_row:f.image_row + (f.maps["latitude"].out + 1) // 2]
+    ticks = [float(m.group(1)) for line in rows if (m := re.match(r"\s*(-?\d+)┤", line))]
+    assert ticks.count(90) == 1 and ticks[0] < 90 and ticks[-1] < 90  # down from the pole both ways
 
 
-def test_line_along_a_wrapped_latitude_reads_true_latitudes(latlon):
+def test_line_along_a_mirrored_latitude_reads_true_latitudes(latlon):
     v = Viewer(Source(latlon))
     v.select_var("air_temperature")
     v.centre_on("latitude", 90.0)
     v.open_line("latitude")
     f = build_frame(v.src, v.request(), 100, 24)
-    labels = "".join(s.text for s in f.lines[-2]).split()
-    assert "±90" in labels
-    assert labels.index("±90") not in (0, len(labels) - 1)
-    assert all(-90 < float(t) < 90 for t in labels if t != "±90")
+    labels = [float(t) for t in "".join(s.text for s in f.lines[-2]).split()]
+    assert 90 in labels and max(labels) == 90
+    assert labels.index(90) not in (0, len(labels) - 1)

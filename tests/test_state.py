@@ -220,7 +220,7 @@ def test_centre_here_with_latitude_puts_the_probe_in_the_middle(latlon):
     assert v.centring_axes(latitude=False) == ["longitude"]
     assert v.centre_here(latitude=True) == ["longitude", "latitude"]
     lat, lon = v.src.dims["latitude"], v.src.dims["longitude"]
-    assert lat.label(v.pos("latitude")) == "60" and v.pos("latitude") == 4  # the middle of 9 rows
+    assert lat.label(v.pos("latitude")) == "60" and v.pos("latitude") == 9  # the middle of 18 rows
     assert lon.label(v.pos("longitude")) == "75"
     assert v.src.read("air_temperature", {"time": 0, "level_height": 0})[v.pos("latitude"), v.pos("longitude")] \
         == value

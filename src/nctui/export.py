@@ -160,7 +160,7 @@ def _draw_map(fig, ax, src: Source, req: Request, data: np.ndarray, lo: float, h
     if req.options.coastlines and xd.is_lon and yd.is_lat:
         xe, ye = _edges(xc), _edges(yc)
         lon, lat = coastlines.load()
-        lon_w, lat_w = coastlines.wrap(lon, lat, min(xe[0], xe[-1]), min(ye[0], ye[-1]) if yd.period else None)
+        lon_w, lat_w = coastlines.wrap(lon, lat, min(xe[0], xe[-1]), mirrored=yd.is_lat and yd.period is not None)
         ax.plot(lon_w, lat_w, color="black" if sum(mpl_cmaps[c.cmap](0.5)[:3]) > 1.5 else "white",
                 linewidth=0.7)
         ax.set_xlim(xe[0], xe[-1])

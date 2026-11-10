@@ -24,15 +24,18 @@ def _to_pixels(values: np.ndarray, centres: np.ndarray) -> np.ndarray:
     return (values - centres[0]) / (centres[-1] - centres[0]) * (n - 1)
 
 
-def wrap(lon: np.ndarray, lat: np.ndarray, lon_base: float, lat_base: float | None) -> tuple[np.ndarray, np.ndarray]:
-    """Coastline points brought into a plot's ranges: longitude ``lon_base`` … + 360, and,
-    for a wrapped latitude axis, latitude ``lat_base`` … + 180. NaN where a line jumps."""
+def wrap(lon: np.ndarray, lat: np.ndarray, lon_base: float, mirrored: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Coastline points brought into a plot's ranges: longitude ``lon_base`` … + 360, NaN
+    where a line jumps. For a latitude axis mirrored at the poles (``mirrored``) the
+    coastline is drawn three times: as it is, and mirrored past each pole (180 - lat
+    and -180 - lat)."""
     lon_w = lon_base + np.mod(lon - lon_base, 360.0)
-    lat_w = lat if lat_base is None else lat_base + np.mod(lat - lat_base, 180.0)
-    jumps = (np.abs(np.diff(lon_w)) > 180) | (np.abs(np.diff(lat_w)) > 90)
-    lon_w = lon_w.copy()
-    lon_w[1:][jumps] = np.nan
-    return lon_w, lat_w
+    lon_w[1:][np.abs(np.diff(lon_w)) > 180] = np.nan
+    if not mirrored:
+        return lon_w, lat
+    gap = np.array([np.nan])
+    return (np.concatenate([lon_w, gap, lon_w, gap, lon_w]),
+            np.concatenate([lat, gap, 180.0 - lat, gap, -180.0 - lat]))
 
 
 def _base(centres: np.ndarray) -> float:
@@ -45,7 +48,7 @@ def rasterise(lon_centres: np.ndarray, lat_centres: np.ndarray, lat_wraps: bool 
 
     ``lon_centres`` and ``lat_centres`` are the coordinates at the centre of each
     output pixel, in screen order (left to right, top to bottom). ``lat_wraps``: the
-    latitude axis is centred, so it runs on past 90 into the south.
+    latitude axis is centred, so it is mirrored at the poles.
     """
     w, h = len(lon_centres), len(lat_centres)
     mask = np.zeros((h, w), dtype=bool)
@@ -53,7 +56,7 @@ def rasterise(lon_centres: np.ndarray, lat_centres: np.ndarray, lat_wraps: bool 
         return mask
     lon, lat = load()
     # bring the coastline into the data's conventions (e.g. longitude 0..360)
-    lon_w, lat_w = wrap(lon, lat, _base(lon_centres), _base(lat_centres) if lat_wraps else None)
+    lon_w, lat_w = wrap(lon, lat, _base(lon_centres), lat_wraps)
     px = _to_pixels(lon_w, lon_centres)
     py = _to_pixels(lat_w, lat_centres)
     finite = np.isfinite(px) & np.isfinite(py)
