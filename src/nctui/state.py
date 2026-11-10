@@ -457,15 +457,17 @@ class Viewer:
         """Wrap ``dim`` round so ``value`` is in the middle of the plot (None: as in the file).
 
         The probe stays on the same grid point and a zoom keeps its size, centred on it.
+        (A centred latitude is twice as long: it is mirrored at the poles.)
         """
         src = self.src
-        n = src.dims[dim].size
-        stored = (self.pos(dim) + src.roll(dim)) % n
+        stored = src.stored_index(dim, self.pos(dim))
         a, b = self.window(dim)
+        zoomed = b - a < src.dims[dim].size
         src.set_centre(dim, value)
-        i = (stored - src.roll(dim)) % n
+        n = src.dims[dim].size
+        i = src.display_index(dim, stored)
         self._pos[self._key(dim)] = (dim, i)
-        if b - a < n:
+        if zoomed:
             self.set_window(dim, *centred_window(n, b - a, i))
         else:
             self._win.pop(self._key(dim), None)

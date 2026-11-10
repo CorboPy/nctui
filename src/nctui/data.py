@@ -139,18 +139,16 @@ class Dim:
     def wrap_value(self, v: float) -> float:
         """A coordinate as it should read: a centred axis's values run on past the
         period (135…495 for longitude centred on 315), its labels don't (135…180, -180…135).
-        A centred latitude runs on past 90 into the south: 100 reads -80."""
+        A centred latitude is mirrored at the poles: past 90 it comes back down, so 100 reads 80."""
         if not self.period:
             return v
+        if self.is_lat:
+            return fold_latitude(v)
         return self.label_base + float(np.mod(v - self.label_base, self.period))
 
     def tick_label(self, v: float) -> str:
-        """Label for a tick at ``v`` on a centred axis. Where a centred latitude wraps, the
-        north and south poles meet: that tick reads ±90."""
-        w = self.wrap_value(v)
-        if self.is_lat and self.period and abs(abs(w) - 90.0) < 1e-9:
-            return "±90"
-        return format_number(w)
+        """Label for a tick at ``v`` on a centred axis, as it reads."""
+        return format_number(self.wrap_value(v))
 
     def nearest(self, value: float) -> int:
         """Index of the coordinate value closest to ``value``."""
@@ -217,6 +215,41 @@ class Dim:
 _NICE_SECONDS = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 2 * 3600, 3 * 3600, 6 * 3600,
                  12 * 3600, 86400, 2 * 86400, 5 * 86400, 10 * 86400)
 _NICE_STRIDES = (1, 2, 3, 4, 5, 6, 10, 12, 20, 24, 50, 60, 100, 120, 200, 240, 500, 1000)
+
+
+def fold_latitude(u: float) -> float:
+    """The latitude shown at ``u`` on a latitude axis mirrored at the poles.
+
+    Going on past the north pole the map comes back down (u = 100 is latitude 80),
+    and past the south pole back up (u = -100 is latitude -80).
+    """
+    u = float(np.mod(u + 180.0, 360.0) - 180.0)
+    if u > 90.0:
+        return 180.0 - u
+    if u < -90.0:
+        return -180.0 - u
+    return u
+
+
+def _mirror_layout(stored: np.ndarray, centre: float) -> tuple[np.ndarray, np.ndarray]:
+    """A latitude axis mirrored at both poles, one full turn (360°) centred on ``centre``.
+
+    Every row of the file appears twice: as itself (u = latitude) and mirrored
+    (u = 180 - latitude past the north pole, or -180 - latitude past the south). A
+    row exactly on a pole is its own mirror, so it appears once. Returns the display
+    coordinate ``u`` and the file row for each, in the file's direction.
+    """
+    n = len(stored)
+    u = np.concatenate([stored, 180.0 - stored])
+    rows = np.concatenate([np.arange(n), np.arange(n)])
+    keep = np.ones(2 * n, dtype=bool)
+    keep[n:] = ~np.isclose(np.abs(stored), 90.0)
+    u, rows = u[keep], rows[keep]
+    u = centre + np.mod(u - centre + 180.0, 360.0) - 180.0
+    order = np.argsort(u, kind="stable")
+    if stored[-1] < stored[0]:
+        order = order[::-1]
+    return u[order].astype(np.float64), rows[order].astype(np.int64)
 
 
 def _pole_to_pole(lat: np.ndarray) -> bool:
@@ -413,6 +446,8 @@ class Source:
         self._read_lock = threading.Lock()
         # centred (wrapped) axes: display index j shows stored index (j + roll) % size
         self._roll: dict[str, int] = {}
+        # mirrored (centred) latitudes: display index j shows the file's row _mirror[d][j]
+        self._mirror: dict[str, np.ndarray] = {}
         self._centres: dict[str, float] = {}
         self._stored_values: dict[str, np.ndarray] = {}
         self._cache = _LRU(cache_mb * 1024 * 1024)
@@ -667,11 +702,15 @@ class Source:
             else:
                 norm[d] = int(np.clip(int(ix), 0, size - 1))
         rolls = {d: self._roll.get(d, 0) for d in v.dims}
-        key = (var, tuple(norm[d] for d in v.dims), tuple(rolls.values()))
+        mirrored = [d for d in v.dims if d in self._mirror]
+        key = (var, tuple(norm[d] for d in v.dims), tuple(rolls.values()), tuple(self._centres[d] for d in mirrored))
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        arr = self._read_rolled(v, norm, rolls) if any(rolls.values()) else self._read_uncached(v, norm)
+        if mirrored:
+            arr = self._read_mirrored(v, norm, rolls, mirrored[0])
+        else:
+            arr = self._read_rolled(v, norm, rolls) if any(rolls.values()) else self._read_uncached(v, norm)
         arr.flags.writeable = False
         self._cache.put(key, arr)
         return arr
@@ -682,7 +721,7 @@ class Source:
         """Length of one period if ``dim`` can be wrapped round, else None.
 
         Longitude can when the grid goes all the way round, and latitude when it
-        reaches both poles (it wraps from the north pole straight to the south, 180°).
+        reaches both poles (it is mirrored at each pole, so one turn is 360°).
         The x and y of a Cartesian grid are taken to be periodic (as model domains
         usually are), as long as they are evenly spaced. Time and levels can't.
         """
@@ -694,7 +733,7 @@ class Source:
         if not (np.all(steps > 0) or np.all(steps < 0)):
             return None
         if d.is_lat:
-            return 180.0 if _pole_to_pole(vals) else None
+            return 360.0 if _pole_to_pole(vals) else None
         step = float(np.median(np.abs(steps)))
         if not np.allclose(np.abs(steps), step, rtol=1e-3):
             return None
@@ -709,24 +748,55 @@ class Source:
     def roll(self, dim: str) -> int:
         return self._roll.get(dim, 0)
 
+    def file_size(self, dim: str) -> int:
+        """Length of ``dim`` in the file (a centred latitude shows each row twice)."""
+        return len(self._stored_values.get(dim, self.dims[dim].values))
+
+    def stored_index(self, dim: str, j: int) -> int:
+        """The file's index shown at display index ``j``."""
+        rows = self._mirror.get(dim)
+        if rows is not None:
+            return int(rows[j])
+        return (j + self._roll.get(dim, 0)) % self.dims[dim].size
+
+    def display_index(self, dim: str, i: int) -> int:
+        """Where the file's index ``i`` is shown (for a mirrored latitude, the unmirrored copy)."""
+        rows = self._mirror.get(dim)
+        if rows is not None:
+            d = self.dims[dim]
+            hits = np.flatnonzero(rows == i)
+            true = self._stored_values[dim][i]
+            return int(min(hits, key=lambda j: abs(d.values[j] - true)))
+        return (i - self._roll.get(dim, 0)) % self.dims[dim].size
+
     def set_centre(self, dim: str, value: float | None) -> None:
         """Wrap ``dim`` round so ``value`` is in the middle (None: back to the file's order).
 
         From then on ``dim``'s values and every read are in the wrapped order: for
-        longitude centred on 0 the axis runs -180 … 180, and latitude centred on 90
-        runs 0 … 90, then on into the south (-89 … -1). Positions and windows given
-        to :meth:`read` count along the wrapped axis.
+        longitude centred on 0 the axis runs -180 … 180. Latitude is mirrored at the
+        poles and shows one full turn: centred on 90 it runs from the south pole up to
+        the north pole in the middle and back down to the south pole, with every row
+        twice. Positions and windows given to :meth:`read` count along the wrapped axis.
         """
         d = self.dims[dim]
         stored = self._stored_values.setdefault(dim, d.values.copy())
         if value is None:
             self._centres.pop(dim, None)
             self._roll.pop(dim, None)
-            self.dims[dim] = replace(d, values=stored, period=None, true_values=None)
+            self._mirror.pop(dim, None)
+            self.dims[dim] = replace(d, size=len(stored), values=stored, period=None, true_values=None)
             return
         period = self.period(dim)
         if period is None:
             raise ValueError(f"{dim} doesn't wrap round" + (" (it doesn't reach both poles)" if d.is_lat else ""))
+        if d.is_lat:
+            if not -90.0 <= value <= 90.0:
+                raise ValueError("a latitude is between -90 and 90")
+            u, rows = _mirror_layout(stored, float(value))
+            self._centres[dim] = float(value)
+            self._mirror[dim] = rows
+            self.dims[dim] = replace(d, size=len(u), values=u, period=period, true_values=stored[rows])
+            return
         wrapped = value + np.mod(stored - value + period / 2, period) - period / 2
         shift = int(np.argmin(wrapped) if stored[-1] > stored[0] else np.argmax(wrapped))
         self._centres[dim] = float(value)
@@ -738,7 +808,36 @@ class Source:
         # longitude reads -180…180 and latitude -90…90; Cartesian x/y stay inside the domain
         base = -180.0 if d.is_lon else -90.0 if d.is_lat else float(np.min(stored)) - step / 2
         self.dims[dim] = replace(d, values=np.roll(wrapped, -shift), period=period, label_base=base,
-                                 true_values=np.roll(stored, -shift) if d.is_lat else None)
+                                 true_values=None)
+
+    def _read_mirrored(self, v: Var, norm: dict[str, Index], rolls: dict[str, int], lat: str) -> np.ndarray:
+        """Read with a latitude mirrored at the poles: runs of rows going up or down the file."""
+        rows = self._mirror[lat]
+
+        def read(norm: dict[str, Index]) -> np.ndarray:
+            return self._read_rolled(v, norm, rolls) if any(rolls.values()) else self._read_uncached(v, norm)
+
+        ix = norm[lat]
+        if isinstance(ix, int):
+            return read({**norm, lat: int(rows[ix])})
+        a, b = ix
+        if b <= a:
+            return read({**norm, lat: (0, 0)})
+        axis = [d for d in v.dims if not isinstance(norm[d], int)].index(lat)
+        parts = []
+        j = a
+        while j < b:
+            k, step = j + 1, 0  # a run of rows one file row apart, all one way
+            while k < b:
+                s = int(rows[k] - rows[k - 1])
+                if abs(s) != 1 or (step and s != step):
+                    break
+                step, k = s, k + 1
+            lo, hi = int(min(rows[j], rows[k - 1])), int(max(rows[j], rows[k - 1])) + 1
+            part = read({**norm, lat: (lo, hi)})
+            parts.append(np.flip(part, axis=axis) if step < 0 else part)
+            j = k
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=axis)
 
     def _read_rolled(self, v: Var, norm: dict[str, Index], rolls: dict[str, int]) -> np.ndarray:
         """Read with some dimensions wrapped round: a window may come in two pieces."""
@@ -818,14 +917,14 @@ class Source:
         whole = sweep is None
         if whole:
             sweep = v.dims[0]
-        n = self.dims[sweep].size
+        n = self.file_size(sweep) if whole else self.dims[sweep].size
         lo, hi = np.inf, -np.inf
         for i in range(n):
             if cancelled is not None and cancelled():
                 return None
             if whole:
                 # straight from disk: a whole-variable scan would flush the slice cache
-                block = self._read_uncached(v, {d: (i if d == sweep else (0, self.dims[d].size)) for d in v.dims})
+                block = self._read_uncached(v, {d: (i if d == sweep else (0, self.file_size(d))) for d in v.dims})
             else:
                 block = self.read(var, {**(index or {}), sweep: i})  # cached: an animation reads these next
             with warnings.catch_warnings():
