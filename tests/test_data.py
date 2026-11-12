@@ -262,3 +262,208 @@ def test_mirror_layout_keeps_one_copy_of_a_row_on_the_pole():
     assert len(u) == 12 and list(u).count(90.0) == 1 and list(u).count(-90.0) == 1
     assert np.all(np.diff(u) == -30.0)
     assert fold_latitude(100.0) == 80.0 and fold_latitude(-100.0) == -80.0 and fold_latitude(45.0) == 45.0
+
+
+# --------------------------------------------------------------------------- reducing over dimensions
+
+
+def _values(path, name):
+    import netCDF4
+
+    with netCDF4.Dataset(path) as ds:
+        return np.ma.filled(ds.variables[name][:].astype(np.float64), np.nan)
+
+
+def _nan(fn, a, axis):
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN columns
+        return fn(a, axis=axis)
+
+
+@pytest.mark.parametrize("stat, fn", [("mean", np.mean), ("min", np.min), ("max", np.max), ("sum", np.sum)])
+def test_reduce_over_time_matches_numpy(cartesian, stat, fn):
+    src = Source(cartesian)
+    theta = _values(cartesian, "theta")
+    out = src.reduce_read("theta", {"full_levels": 2}, (("time", stat),))
+    assert out.shape == (5, 7) and out.dtype == np.float64
+    np.testing.assert_allclose(out, fn(theta[:, 2], axis=0))
+
+
+@pytest.mark.parametrize("stat, fn", [("mean", np.nanmean), ("min", np.nanmin), ("max", np.nanmax)])
+def test_reduce_ignores_missing_values(gappy, stat, fn):
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    out = src.reduce_read("sst", {}, (("time", stat),))
+    np.testing.assert_allclose(out, _nan(fn, sst, 0))
+    assert np.isnan(out[1, 2]) and np.isfinite(out).sum() == out.size - 1  # only the all-missing column
+
+
+def test_sum_of_nothing_is_missing_not_zero(gappy):
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    out = src.reduce_read("sst", {}, (("time", "sum"),))
+    expected = np.nansum(sst, axis=0)
+    expected[1, 2] = np.nan
+    np.testing.assert_allclose(out, expected)
+
+
+def test_mean_over_latitude_is_cos_weighted(gappy):
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    w = np.cos(np.deg2rad(np.linspace(-60, 60, 4)))[None, :, None] * np.isfinite(sst)
+    with np.errstate(invalid="ignore"):
+        expected = np.nansum(sst * w, axis=1) / w.sum(axis=1)  # 0/0 where a column is all missing
+    out = src.reduce_read("sst", {}, (("lat", "mean"),))
+    np.testing.assert_allclose(out, expected)
+    assert not np.allclose(out, np.nanmean(sst, axis=1), equal_nan=True)  # the plain mean differs
+    assert src.reduce_weighting("sst", (("lat", "mean"),)) == "cos(lat)-weighted mean"
+    # other statistics, and a mean that leaves latitude alone, are not weighted
+    np.testing.assert_allclose(src.reduce_read("sst", {}, (("lat", "max"),)), _nan(np.nanmax, sst, 1))
+    np.testing.assert_allclose(src.reduce_read("sst", {}, (("lon", "mean"),)), _nan(np.nanmean, sst, 2))
+    assert src.reduce_weighting("sst", (("lon", "mean"),)) == "unweighted mean"
+    assert src.reduce_weighting("sst", (("lat", "max"),)) == ""
+
+
+def test_mean_over_a_cartesian_y_is_not_weighted(cartesian):
+    src = Source(cartesian)
+    theta = _values(cartesian, "theta")
+    out = src.reduce_read("theta", {"time": 1, "full_levels": 0}, (("projection_y_coordinate", "mean"),))
+    np.testing.assert_allclose(out, theta[1, 0].mean(axis=0))
+    assert src.reduce_weighting("theta", (("projection_y_coordinate", "mean"),)) == "unweighted mean"
+
+
+def test_dimensions_sharing_a_statistic_collapse_together(gappy):
+    """A domain mean is one weighted mean of every valid point, not a mean of zonal means."""
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    w = np.cos(np.deg2rad(np.linspace(-60, 60, 4)))[None, :, None] * np.isfinite(sst)
+    series = src.reduce_read("sst", {}, (("lat", "mean"), ("lon", "mean")))
+    np.testing.assert_allclose(series, np.nansum(sst * w, axis=(1, 2)) / w.sum(axis=(1, 2)))
+    everything = src.reduce_read("sst", {}, (("time", "mean"), ("lat", "mean"), ("lon", "mean")))
+    assert everything.shape == ()
+    np.testing.assert_allclose(everything, np.nansum(sst * w) / w.sum())
+
+
+def test_different_statistics_apply_from_the_last_dimension_to_the_first(gappy):
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    out = src.reduce_read("sst", {}, (("time", "max"), ("lon", "mean")))
+    np.testing.assert_allclose(out, _nan(np.nanmax, _nan(np.nanmean, sst, 2), 0))
+
+
+def test_reduce_reads_in_blocks_with_progress_and_cancel(gappy, monkeypatch):
+    from nctui import data
+
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    whole = src.reduce_read("sst", {}, (("time", "mean"), ("lat", "mean")))
+    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 6 * 2)  # two latitudes of one time step at once
+    src = Source(gappy)
+    seen = []
+    out = src.reduce_read("sst", {}, (("time", "mean"), ("lat", "mean")), progress=seen.append)
+    np.testing.assert_allclose(out, whole)
+    assert len(seen) == 10 and seen[-1] == 1.0 and seen == sorted(seen)
+    # cancelling part way gives nothing, and leaves nothing half-done behind
+    src = Source(gappy)
+    calls = []
+    assert src.reduce_read("sst", {}, (("time", "max"),), cancelled=lambda: calls.append(1) or len(calls) > 2) is None
+    assert not src.reduce_cached("sst", {}, (("time", "max"),))
+    np.testing.assert_allclose(src.reduce_read("sst", {}, (("time", "max"),)), _nan(np.nanmax, sst, 0))
+
+
+def test_reduced_result_is_cached_whatever_the_window(cartesian, monkeypatch):
+    src = Source(cartesian)
+    theta = _values(cartesian, "theta")
+    reduce = (("time", "mean"),)
+    assert not src.reduce_cached("theta", {"full_levels": 1}, reduce)
+    full = src.reduce_read("theta", {"full_levels": 1}, reduce)
+    assert src.reduce_cached("theta", {"full_levels": 1, "projection_x_coordinate": (2, 5)}, reduce)
+    assert not src.reduce_cached("theta", {"full_levels": 2}, reduce)  # another level is another field
+    monkeypatch.setattr(src, "_slice", lambda *a: pytest.fail("read the file again"))
+    zoomed = src.reduce_read("theta", {"full_levels": 1, "projection_x_coordinate": (2, 5),
+                                       "projection_y_coordinate": (1, 3)}, reduce)
+    np.testing.assert_allclose(zoomed, theta[:, 1].mean(axis=0)[1:3, 2:5])
+    np.testing.assert_allclose(zoomed, full[1:3, 2:5])
+    with pytest.raises(ValueError):
+        full[0, 0] = 1  # read-only, like every read
+
+
+def test_reduce_over_joined_files(split_files):
+    src = Source(split_files)
+    parts = [_values(p, "theta") for p in sorted(split_files, key=lambda p: p.name)]  # a, b, c: in time order
+    theta = np.concatenate(parts, axis=0)
+    assert theta.shape[0] == 6
+    out = src.reduce_read("theta", {"full_levels": 0}, (("time", "mean"),))
+    np.testing.assert_allclose(out, theta[:, 0].mean(axis=0))
+    assert out[0, 0] == 2500.0  # 1000 × the mean of time steps 0…5
+    series = src.reduce_read("theta", {"full_levels": 3}, (("projection_y_coordinate", "max"),
+                                                           ("projection_x_coordinate", "max")))
+    np.testing.assert_allclose(series, theta[:, 3].max(axis=(1, 2)))
+
+
+def test_reduce_follows_a_centred_longitude_without_reading_again(latlon, monkeypatch):
+    src = Source(latlon)
+    ta = _values(latlon, "air_temperature")
+    reduce = (("time", "mean"),)
+    plain = src.reduce_read("air_temperature", {"level_height": 0}, reduce)
+    np.testing.assert_allclose(plain, np.nanmean(ta[:, 0], axis=0))
+    with monkeypatch.context() as m:
+        m.setattr(src, "_slice", lambda *a: pytest.fail("read the file again"))
+        src.set_centre("longitude", 0.0)
+        shift = src.roll("longitude")
+        assert shift
+        wrapped = src.reduce_read("air_temperature", {"level_height": 0}, reduce)
+        np.testing.assert_allclose(wrapped, np.roll(plain, -shift, axis=1))
+        window = src.reduce_read("air_temperature", {"level_height": 0, "longitude": (4, 9)}, reduce)
+        np.testing.assert_allclose(window, np.roll(plain, -shift, axis=1)[:, 4:9])
+    # a position along the centred axis is the same grid point as before
+    j = 5
+    line = src.reduce_read("air_temperature", {"level_height": 0, "longitude": j}, (("latitude", "max"),))
+    np.testing.assert_allclose(line, np.nanmax(ta[:, 0, :, src.stored_index("longitude", j)], axis=1))
+
+
+def test_reduce_counts_each_row_of_a_mirrored_latitude_once(latlon):
+    ta = _values(latlon, "air_temperature")
+    src = Source(latlon)
+    src.set_centre("latitude", -90.0)  # centred before anything is reduced: nothing comes from the cache
+    assert src.dims["latitude"].size == 18  # every row twice on screen
+    # collapsing the mirrored latitude still sums the file's nine rows
+    total = src.reduce_read("air_temperature", {"time": 1, "level_height": 2}, (("latitude", "sum"),))
+    np.testing.assert_allclose(total, ta[1, 2].sum(axis=0))
+    weighted = src.reduce_read("air_temperature", {"time": 1, "level_height": 2}, (("latitude", "mean"),))
+    w = np.cos(np.deg2rad(np.linspace(-80, 80, 9)))[:, None]
+    np.testing.assert_allclose(weighted, (ta[1, 2] * w).sum(axis=0) / w.sum())
+    # a mirrored latitude that is kept shows each row of the time mean twice
+    shown = src.reduce_read("air_temperature", {"level_height": 0}, (("time", "mean"),))
+    assert shown.shape == (18, 12)
+    np.testing.assert_allclose(shown, np.nanmean(ta[:, 0], axis=0)[src._mirror["latitude"]])
+    # and a position along it is the file's row, whichever copy the probe is on
+    j = 15
+    series = src.reduce_read("air_temperature", {"level_height": 0, "latitude": j}, (("longitude", "max"),))
+    np.testing.assert_allclose(series, ta[:, 0, src.stored_index("latitude", j)].max(axis=1))
+    # undoing the centring gives the same fields back, in the file's order
+    src.set_centre("latitude", None)
+    np.testing.assert_allclose(src.reduce_read("air_temperature", {"level_height": 0}, (("time", "mean"),)),
+                               np.nanmean(ta[:, 0], axis=0))
+
+
+def test_reduce_rejects_unknown_dimensions_and_statistics(cartesian):
+    src = Source(cartesian)
+    with pytest.raises(ValueError):
+        src.reduce_read("theta", {}, (("half_levels", "mean"),))
+    with pytest.raises(ValueError):
+        src.reduce_read("theta", {}, (("time", "median"),))
+
+
+def test_value_range_of_a_reduced_view(cartesian):
+    src = Source(cartesian)
+    theta = _values(cartesian, "theta")
+    seen = []
+    rng = src.value_range("theta", {"projection_x_coordinate": (0, 7), "projection_y_coordinate": (0, 5)},
+                          "full_levels", seen.append, reduce=(("time", "mean"),))
+    means = theta.mean(axis=0)
+    assert rng == (means.min(), means.max())
+    assert seen[-1] == 1.0 and seen == sorted(seen)
+    assert src.reduce_cached("theta", {"full_levels": 4}, (("time", "mean"),))  # an animation reads these next

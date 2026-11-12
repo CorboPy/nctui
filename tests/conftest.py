@@ -90,6 +90,24 @@ def make_pressure(path: Path) -> Path:
     return path
 
 
+def make_gappy(path: Path, nt=5, nlat=4, nlon=6) -> Path:
+    """A t/lat/lon field with missing points scattered through it and one column missing at every time."""
+    rng = np.random.default_rng(1)
+    data = rng.normal(10, 3, (nt, nlat, nlon))
+    data[rng.random(data.shape) < 0.2] = np.nan
+    data[:, 1, 2] = np.nan
+    ds = xr.Dataset(
+        {"sst": (("time", "lat", "lon"), data, {"units": "degC"})},
+        coords={
+            "time": ("time", np.arange(nt) * 1.0, {"units": "days since 2000-01-01 00:00:00"}),
+            "lat": ("lat", np.linspace(-60, 60, nlat), {"units": "degrees_north"}),
+            "lon": ("lon", np.arange(nlon) * 360.0 / nlon, {"units": "degrees_east"}),
+        },
+    )
+    ds.to_netcdf(path)
+    return path
+
+
 @pytest.fixture
 def cartesian(tmp_path) -> Path:
     return make_cartesian(tmp_path / "cart.nc")
@@ -98,6 +116,11 @@ def cartesian(tmp_path) -> Path:
 @pytest.fixture
 def latlon(tmp_path) -> Path:
     return make_latlon(tmp_path / "latlon.nc")
+
+
+@pytest.fixture
+def gappy(tmp_path) -> Path:
+    return make_gappy(tmp_path / "gappy.nc")
 
 
 @pytest.fixture
