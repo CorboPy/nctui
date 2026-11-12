@@ -1,5 +1,8 @@
 """Save the current view as an image with matplotlib, using every data point.
 
+A reduced view (a time mean, a zonal mean…) is reduced again from the file's data,
+or taken from the source's cache of it: never from the pixels on screen.
+
 matplotlib is imported only here, so starting nctui doesn't pay for it.
 """
 
@@ -14,7 +17,7 @@ import numpy as np
 
 from . import coastlines
 from .data import Dim, Source, same_units
-from .frame import _view_name, short_name
+from .frame import Cancelled, _view_name, request_data, short_name
 from .state import Request
 
 
@@ -27,12 +30,15 @@ def default_filename(src: Source, req: Request, skip: str | None = None) -> str:
     """``./var_position_position.png`` for the current view (leaving out dimension ``skip``)."""
     v = src.vars[req.var]
     idx = req.index_dict()
+    reduced = req.reduce_dict()
     parts = [req.var]
     if req.kind == "line":
         parts.append(_view_name(src, req).split(" ")[0].replace("time", "series"))
     for d in v.dims:
-        ix = idx[d]
-        if isinstance(ix, int) and d != skip:
+        ix = idx.get(d)
+        if d in reduced:
+            parts.append(f"{short_name(d)}{reduced[d]}")
+        elif isinstance(ix, int) and d != skip:
             dim = src.dims[d]
             label = dim.label(ix, with_lead=False)
             parts.append(_clean(label) if dim.dates is not None else f"{short_name(d)}{_clean(label)}")
@@ -41,10 +47,15 @@ def default_filename(src: Source, req: Request, skip: str | None = None) -> str:
 
 
 def default_title(src: Source, req: Request, header: str) -> str:
+    """The variable, how a mean over dimensions was weighted if it was, then ``header``
+    (the view, with each position or reduction)."""
     v = src.vars[req.var]
     first = v.long_name or v.name
     if v.units:
         first += f" ({v.units})"
+    weighting = src.reduce_weighting(req.var, req.reduce)
+    if weighting.startswith("cos"):
+        first += f", {weighting}"
     return f"{first}\n{header}" if header else first
 
 
@@ -85,10 +96,6 @@ def _cell_aspect(xd: Dim, yd: Dim) -> float | str:
     return float(sx / sy) if xd.size > 1 and yd.size > 1 and sx > 0 and sy > 0 else "auto"
 
 
-class Cancelled(Exception):
-    """Saving was cancelled."""
-
-
 def _check_folder(path: str) -> str:
     path = os.path.expanduser(path)
     folder = os.path.dirname(os.path.abspath(path))
@@ -119,12 +126,12 @@ def _value_label(src: Source, req: Request) -> str:
     return (v.long_name or v.name) + (f" ({v.units})" if v.units else "")
 
 
-def _map_data(src: Source, req: Request) -> np.ndarray:
-    """The plotted window as [y, x]."""
+def _map_data(src: Source, req: Request, cancelled: Callable[[], bool] | None = None) -> np.ndarray:
+    """The plotted window as [y, x], reduced as the request asks."""
     v = src.vars[req.var]
     idx = req.index_dict()
-    data = src.read(req.var, idx)
-    kept = [d for d in v.dims if not isinstance(idx[d], int)]
+    data = request_data(src, req, cancelled=cancelled)
+    kept = [d for d in v.dims if isinstance(idx.get(d), tuple)]
     if kept.index(req.xdim) < kept.index(req.ydim):
         data = data.T
     return data
@@ -181,16 +188,18 @@ def _draw_map(fig, ax, src: Source, req: Request, data: np.ndarray, lo: float, h
     return mesh, bar
 
 
-def _line_values(src: Source, req: Request) -> tuple[np.ndarray, np.ndarray]:
+def _line_values(src: Source, req: Request,
+                 cancelled: Callable[[], bool] | None = None) -> tuple[np.ndarray, np.ndarray]:
     d = src.dims[req.xdim]
     a, b = req.index_dict()[req.xdim]
-    return d.values[a:b], np.asarray(src.read(req.var, req.index_dict()), dtype=float).reshape(-1)
+    return d.values[a:b], np.asarray(request_data(src, req, cancelled=cancelled), dtype=float).reshape(-1)
 
 
-def _draw_line(fig, ax, src: Source, req: Request, value_range: tuple[float, float] | None):
+def _draw_line(fig, ax, src: Source, req: Request, value_range: tuple[float, float] | None,
+               cancelled: Callable[[], bool] | None = None):
     """A profile (vertical coordinate up the side) or a line against the coordinate."""
     d = src.dims[req.xdim]
-    coord, values = _line_values(src, req)
+    coord, values = _line_values(src, req, cancelled)
     marker = "o" if len(values) <= 40 else None
     label = _value_label(src, req)
     if d.role == "z":
@@ -244,7 +253,7 @@ def save_figure(
         _draw_line(fig, ax, src, req, vrange)
     else:
         v = src.vars[req.var]
-        value = float(np.asarray(src.read(req.var, {})).reshape(-1)[0])
+        value = float(np.asarray(request_data(src, req)).reshape(-1)[0])
         ax.text(0.5, 0.5, f"{v.name} = {value:.6g} {v.units}", ha="center", va="center", fontsize=16)
         ax.set_axis_off()
     if title:
@@ -293,7 +302,8 @@ def save_animation(
 
     ``vrange`` fixes the colour (or value-axis) range for every frame; None fits each
     frame as the TUI's auto range does. Each frame's title gets that frame's header
-    (view, time, level) under ``title``. Returns the absolute path.
+    (view, time, level, what is reduced) under ``title``. Returns the absolute path.
+    ``cancelled`` is asked between frames, and while a reduced frame is being read.
     """
     from matplotlib import animation
 
@@ -327,12 +337,12 @@ def save_animation(
 
     fig, ax = _new_figure(size, dpi)
     if req.kind == "map":
-        first = _map_data(src, frames[0])
+        first = _map_data(src, frames[0], cancelled)
         if vrange is not None:
             # arrows on the colour bar if any frame goes beyond the fixed range
             dlo, dhi = np.inf, -np.inf
             for r in frames:
-                d = _map_data(src, r)
+                d = _map_data(src, r, cancelled)
                 if np.isfinite(d).any():
                     dlo, dhi = min(dlo, float(np.nanmin(d))), max(dhi, float(np.nanmax(d)))
             lo, hi = vrange
@@ -342,7 +352,7 @@ def save_animation(
             extend = "neither"
         mesh, _ = _draw_map(fig, ax, src, req, first, lo, hi, extend)
     else:
-        line = _draw_line(fig, ax, src, frames[0], vrange)
+        line = _draw_line(fig, ax, src, frames[0], vrange, cancelled)
     ax.set_title(heading(frames[0]), fontsize=10)
     fig.canvas.draw()
     fig.set_layout_engine("none")  # keep the layout still: colour bar labels change width
@@ -356,13 +366,13 @@ def save_animation(
                 if k and cancelled is not None and cancelled():
                     raise Cancelled
                 if req.kind == "map":
-                    data = _map_data(src, r)
+                    data = _map_data(src, r, cancelled)
                     if vrange is None:
                         lo, hi = colour_range(req.colour, data, None)
                         mesh.norm.vmin, mesh.norm.vmax = lo, hi
                     mesh.set_array(np.ma.masked_invalid(data))
                 else:
-                    coord, values = _line_values(src, r)
+                    coord, values = _line_values(src, r, cancelled)
                     if src.dims[req.xdim].role == "z":
                         line.set_data(values, coord)
                     else:

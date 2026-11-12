@@ -124,3 +124,117 @@ def test_save_map_with_latitude_wrapped(latlon, tmp_path):
     v.options.coastlines = True
     out = export.save_figure(src, v.request(), str(tmp_path / "pole.png"), "pole")
     assert (tmp_path / "pole.png").stat().st_size > 0 and out.endswith("pole.png")
+
+
+# --------------------------------------------------------------------------- reduced views
+
+
+def _field(path, name):
+    import netCDF4
+
+    with netCDF4.Dataset(path) as ds:
+        return np.ma.filled(ds.variables[name][:].astype(np.float64), np.nan)
+
+
+def _drawn(monkeypatch):
+    """Record the arrays handed to matplotlib."""
+    drawn = []
+    draw_map, draw_line = export._draw_map, export._draw_line
+
+    def spy_map(fig, ax, src, req, data, *args):
+        drawn.append(np.array(data))
+        return draw_map(fig, ax, src, req, data, *args)
+
+    def spy_line(fig, ax, src, req, *args):
+        drawn.append(export._line_values(src, req)[1])
+        return draw_line(fig, ax, src, req, *args)
+
+    monkeypatch.setattr(export, "_draw_map", spy_map)
+    monkeypatch.setattr(export, "_draw_line", spy_line)
+    return drawn
+
+
+def test_saved_map_is_reduced_from_every_data_point(tmp_path, monkeypatch):
+    from .conftest import make_cartesian
+
+    path = make_cartesian(tmp_path / "wide.nc", nt=3, nz=2, ny=40, nx=300)  # wider than any terminal plot
+    theta = _field(path, "theta")
+    v = Viewer(Source(path))
+    v.select_var("theta")
+    v.set_pos("full_levels", 1)
+    v.set_reduction("time", "max")
+    drawn = _drawn(monkeypatch)
+    export.save_figure(v.src, v.request(), str(tmp_path / "max.png"), "", (4, 3), 50)
+    assert drawn[0].shape == (40, 300)
+    np.testing.assert_allclose(drawn[0], theta[:, 1].max(axis=0))
+    # zoomed: the window of the same field
+    v.set_window("projection_x_coordinate", 100, 220)
+    export.save_figure(v.src, v.request(), str(tmp_path / "zoom.png"), "", (4, 3), 50)
+    np.testing.assert_allclose(drawn[1], theta[:, 1].max(axis=0)[:, 100:220])
+
+
+def test_saved_domain_mean_series_and_single_value(latlon, tmp_path, monkeypatch):
+    ta = _field(latlon, "air_temperature")
+    v = Viewer(Source(latlon))
+    v.select_var("air_temperature")
+    v.set_pos("level_height", 1)
+    v.set_reduction("latitude", "mean")
+    v.set_reduction("longitude", "mean")
+    v.set_axes("time", None)
+    drawn = _drawn(monkeypatch)
+    out = tmp_path / "series.png"
+    export.save_figure(v.src, v.request(), str(out), "series", (4, 3), 50)
+    w = np.cos(np.deg2rad(np.linspace(-80, 80, 9)))[None, :, None] * np.isfinite(ta[:, 1])
+    np.testing.assert_allclose(drawn[0], np.nansum(ta[:, 1] * w, axis=(1, 2)) / w.sum(axis=(1, 2)))
+    assert out.stat().st_size > 0
+    v.set_reduction("time", "mean")
+    v.set_reduction("level_height", "mean")
+    assert v.kind == "scalar"
+    export.save_figure(v.src, v.request(), str(tmp_path / "one.png"), "", (4, 3), 50)
+    assert (tmp_path / "one.png").stat().st_size > 0
+
+
+def test_file_name_and_title_say_what_was_reduced(latlon, viewer):
+    viewer.set_pos("full_levels", 2)
+    viewer.set_reduction("time", "mean")
+    req = viewer.request()
+    assert export.default_filename(viewer.src, req) == "./theta_timemean_full_levels2.png"
+    assert export.default_animation_filename(viewer.src, req, "full_levels").startswith(
+        "./theta_timemean_full_levels_anim.")
+    assert export.default_title(viewer.src, req, "map y–x · time mean") == \
+        "air_potential_temperature (K)\nmap y–x · time mean"
+    v = Viewer(Source(latlon))
+    v.select_var("toa_flux")
+    v.set_reduction("latitude", "mean")
+    v.set_reduction("longitude", "min")
+    req = v.request()
+    assert export.default_filename(v.src, req) == "./toa_flux_series_latitudemean_longitudemin.png"
+    assert export.default_title(v.src, req, "") == "toa_flux (W m-2), cos(lat)-weighted mean"
+
+
+def test_animation_of_a_reduced_view(viewer, tmp_path, monkeypatch):
+    theta = _field(viewer.src.paths[0], "theta")
+    viewer.set_reduction("time", "mean")
+    titles = []
+    drawn = _drawn(monkeypatch)
+    monkeypatch.setattr(export, "_fit_title", lambda text, width, fontsize=10: titles.append(text) or text)
+    out = export.save_animation(viewer.src, viewer.request(), "full_levels", [0, 2, 5], str(tmp_path / "m.gif"),
+                                "theta", (3, 2), 40, 4)
+    assert len(_gif_frames(out)) == 3
+    np.testing.assert_allclose(drawn[0], theta[:, 0].mean(axis=0))
+    assert titles[-1] == "theta\nmap y–x · time mean · full_levels 5"
+    assert viewer.src.reduce_cached("theta", {"full_levels": 5}, (("time", "mean"),))
+
+
+def test_animation_of_a_reduced_view_can_be_cancelled_while_reducing(viewer, tmp_path, monkeypatch):
+    from nctui import data
+
+    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 1)  # several blocks, so there is a "part way"
+    viewer.set_reduction("time", "mean")
+    out = tmp_path / "c.gif"
+    asked = []
+    with pytest.raises(export.Cancelled):
+        export.save_animation(viewer.src, viewer.request(), "full_levels", [0, 1, 2], str(out),
+                              cancelled=lambda: asked.append(1) or len(asked) > 2)
+    assert not out.exists()
+    assert not viewer.src.reduce_cached("theta", {"full_levels": 0}, (("time", "mean"),))
