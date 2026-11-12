@@ -64,7 +64,8 @@ def test_plot_weighted_domain_mean(latlon, capsys):
     code, out, _ = _plot(capsys, latlon, "-v", "toa_flux", "--mean", "latitude", "--mean", "longitude")
     assert code == 0
     assert "time series along time · latitude mean · longitude mean" in out
-    assert "min 1  max 1  mean 1" in out and "cos(lat)-weighted mean" in out
+    assert "min 1  max 1  mean 1" in out
+    assert "→ 1 W m-2 · cos(lat)-weighted mean" in " ".join(out.split())  # the status line wraps at 80
 
 
 def test_plot_rejects_bad_reductions(cartesian, capsys):

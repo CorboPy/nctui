@@ -223,7 +223,7 @@ def test_time_mean_map_frame(cartesian):
     mean = theta[:, 2].mean(axis=0)
     assert f.vrange == (mean.min(), mean.max())
     assert f.probe_value == mean[2, 3]  # the probe reads the mean, at every data point
-    assert "unweighted mean" in f.status and f.status.index("unweighted mean") < f.status.index("probe")
+    assert f.status.endswith("→ 1723 K · unweighted mean")  # after the probe readout, which matters more
 
 
 def test_zonal_mean_section_and_its_profile(latlon):

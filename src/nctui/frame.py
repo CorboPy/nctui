@@ -322,12 +322,12 @@ def _map_frame(src: Source, req: Request, data: np.ndarray, width: int, height: 
     status = f"{_reduction_text(req.xdim, xmap, xd.size)} · {_reduction_text(req.ydim, ymap, yd.size)}"
     if reduced:
         status += f" ({METHOD_LABELS[opts.method]})"
-    status += _weighting(src, req)
     probe_value = None
     if pxp is not None and pyp is not None and xa <= pxp < xb and ya <= pyp < yb:
         probe_value = float(data[pyp - ya, pxp - xa])
         status += (f" · probe {short_name(req.xdim)}={xd.label(pxp)} {short_name(req.ydim)}={yd.label(pyp)}"
                    f" → {_value_text(probe_value, v.units)}")
+    status += _weighting(src, req)  # last: on a narrow pane it is cut off before the probe readout is
     return Frame(
         request=req,
         lines=fig.lines,
@@ -397,11 +397,11 @@ def _line_frame(src: Source, req: Request, data: np.ndarray, width: int, height:
     of = f" of {d.size}" if n != d.size else ""
     dots = fig.coord_dots
     status = f"{short_name(req.xdim)} {n}{of} points on {dots} dots" + (" 1:1" if dots >= n else f" ÷{n / dots:.1f}")
-    status += _weighting(src, req)
     probe_value = None
     if marker is not None:
         probe_value = float(values[marker])
         status += f" · {short_name(req.xdim)}={d.label(marker_i)} → {_value_text(probe_value, v.units)}"
+    status += _weighting(src, req)
     maps = {req.xdim: AxisMap(a, n, max(1, dots), reverse=False)}
     return Frame(
         request=req,
