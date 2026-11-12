@@ -555,12 +555,12 @@ class NctuiApp(App):
         key = viewer.anim_range_key()
         if key is None or key in viewer.anim_ranges or key == self._scan_key:
             return
-        var, dim, rest = key
+        var, dim, rest, reduce = key
         self._scan_key = key
-        self._scan_range(key, var, dict(rest), dim)
+        self._scan_range(key, var, dict(rest), dim, reduce)
 
     @work(thread=True, group="scan", exclusive=True, exit_on_error=False)
-    def _scan_range(self, key: tuple, var: str, index: dict, dim: str) -> None:
+    def _scan_range(self, key: tuple, var: str, index: dict, dim: str, reduce: tuple) -> None:
         worker = get_current_worker()
         label = f"scanning {var} over {short_name(dim)}"
 
@@ -571,7 +571,7 @@ class NctuiApp(App):
                 self.call_from_thread(self._update_topbar, f"{label} {pct}%")
 
         try:
-            rng = self.src.value_range(var, index, dim, progress, cancelled=lambda: worker.is_cancelled)
+            rng = self.src.value_range(var, index, dim, progress, lambda: worker.is_cancelled, reduce)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(self.notify, f"Couldn't scan {var}: {exc}", severity="error")
             rng = None
@@ -696,10 +696,10 @@ class NctuiApp(App):
                 rng = req.anim_range
                 if c.mode == "anim" and rng is None and key is not None:
                     self.call_from_thread(screen.progress, f"scanning all {short_name(dim)} steps…")
-                    rng = self.src.value_range(req.var, dict(key[2]), dim)
+                    rng = self.src.value_range(req.var, dict(key[2]), dim, reduce=key[3])
                 vrange = colour_range(c, np.empty(0), rng)  # adds symmetric / log as on screen
             if req.kind == "line" and c.mode == "anim" and vrange is None and key is not None:
-                vrange = self.src.value_range(req.var, dict(key[2]), dim)
+                vrange = self.src.value_range(req.var, dict(key[2]), dim, reduce=key[3])
 
             def progress(k: int, n: int) -> None:
                 self.call_from_thread(screen.progress, f"saving frame {k} of {n}…")

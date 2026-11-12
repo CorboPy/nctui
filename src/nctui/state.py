@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from . import colormaps
-from .data import OTHER, TIME, Index, Source, Var, X, Y, Z, same_units
+from .data import OTHER, STATS, TIME, Index, Reduce, Source, Var, X, Y, Z, same_units
 from .reduce import AxisMap, centred_window, every_point_lengths
 
 # (x role, y role) of the preset views, in the order `v` cycles through them
@@ -57,11 +57,12 @@ class Request:
     kind: str  # "map" | "line" | "scalar"
     xdim: str | None  # map: x axis; line: the line's dimension
     ydim: str | None  # map: y axis
-    index: tuple[tuple[str, Index], ...]
+    index: tuple[tuple[str, Index], ...]  # every dimension that isn't reduced
     probe: tuple[tuple[str, int], ...]
     colour: Colour
     options: Options
     equal: bool
+    reduce: Reduce = ()  # dimensions collapsed by a statistic: (dimension, statistic)
     anim_range: tuple[float, float] | None = None  # "anim" colour mode: range over every step
     anim_dim: str | None = None  # the dimension an animation runs along
     selection: tuple[int, int, int, int] | None = None  # pixel box while dragging
@@ -71,6 +72,9 @@ class Request:
 
     def probe_dict(self) -> dict[str, int]:
         return dict(self.probe)
+
+    def reduce_dict(self) -> dict[str, str]:
+        return dict(self.reduce)
 
 
 class Viewer:
@@ -84,6 +88,8 @@ class Viewer:
         # over between variables on different dimensions (full_levels ↔ half_levels)
         self._pos: dict[str, tuple[str, int]] = {}
         self._win: dict[str, tuple[str, int, int]] = {}
+        # dimensions collapsed by a statistic (mean, min, max, sum), per role like positions
+        self._reduce: dict[str, str] = {}
         self.stack: list[tuple[str, str | None, str | None]] = []
         self.colours: dict[str, Colour] = {}
         self.options = Options()
@@ -111,9 +117,14 @@ class Viewer:
         return dim if r == OTHER else r
 
     def role_dim(self, role: str) -> str | None:
+        """The dimension with this role that can go on the plot."""
+        return next((d for d in self.live_dims() if self.role(d) == role), None)
+
+    def live_dims(self) -> list[str]:
+        """The variable's dimensions that aren't collapsed by a statistic."""
         if self.var is None:
-            return None
-        return next((d for d in self.v.dims if self.role(d) == role), None)
+            return []
+        return [d for d in self.v.dims if self._key(d) not in self._reduce]
 
     def plotted(self) -> list[str]:
         if self.kind == "map":
@@ -123,10 +134,47 @@ class Viewer:
         return []
 
     def free_dims(self) -> list[str]:
-        if self.var is None:
-            return []
+        """Dimensions with a position to step through: not plotted, not reduced."""
         p = self.plotted()
-        return [d for d in self.v.dims if d not in p]
+        return [d for d in self.live_dims() if d not in p]
+
+    # ------------------------------------------------------------------ reductions
+
+    def reduction(self, dim: str) -> str | None:
+        """The statistic ``dim`` is collapsed with, if it is."""
+        return self._reduce.get(self._key(dim))
+
+    def reductions(self) -> Reduce:
+        """(dimension, statistic) for each of this variable's reduced dimensions."""
+        if self.var is None:
+            return ()
+        return tuple((d, self._reduce[self._key(d)]) for d in self.v.dims if self._key(d) in self._reduce)
+
+    def set_reduction(self, dim: str, stat: str | None) -> bool:
+        """Collapse ``dim`` with ``stat`` (mean, min, max or sum); None restores it.
+
+        A reduced dimension has no position and can't be plotted. If it was on the
+        plot, the view becomes the nearest one of the dimensions left: a line if there
+        is one, a single value if none. Restoring it keeps a view that still stands.
+        """
+        if self.var is None or dim not in self.v.dims:
+            raise ValueError(f"{self.var} has no dimension {dim}")
+        if stat is not None and stat not in STATS:
+            raise ValueError(f"unknown statistic {stat!r}: choose from {', '.join(STATS)}")
+        if self.reduction(dim) == stat:
+            return False
+        only_view = len(self.live_dims()) < 2  # a line or value because nothing else was left
+        if stat is None:
+            del self._reduce[self._key(dim)]
+        else:
+            self._reduce[self._key(dim)] = stat
+        prev = self._view()
+        if self.kind == "line" and self.xdim == dim and self.stack:
+            prev = self._view(*self.stack.pop())  # a profile's own dimension: back to its map
+        elif not only_view and all(d in self.live_dims() for d in self.plotted()):
+            return True
+        self._settle(*prev)
+        return True
 
     # ------------------------------------------------------------------ positions
 
@@ -145,6 +193,8 @@ class Viewer:
         return d.nearest(other.values[int(np.clip(i, 0, other.size - 1))])
 
     def set_pos(self, dim: str, i: int) -> bool:
+        if self.reduction(dim) is not None:
+            return False  # collapsed: there is no position along it
         size = self.src.dims[dim].size
         i = int(np.clip(i, 0, size - 1))
         changed = self.pos(dim) != i
@@ -155,7 +205,7 @@ class Viewer:
 
     def step(self, dim: str | None, delta: int, wrap: bool = False) -> bool:
         """Move ``dim`` by ``delta``; ``wrap`` goes round from the last step to the first."""
-        if dim is None:
+        if dim is None or self.reduction(dim) is not None:
             return False
         i = self.pos(dim) + delta
         if wrap:
@@ -218,20 +268,30 @@ class Viewer:
     # ------------------------------------------------------------------ variables & views
 
     def select_var(self, name: str) -> None:
-        v = self.src.vars[name]
-        prev_kind, prev_x, prev_y = self.kind, self.xdim, self.ydim
-        prev_roles = (self.role(prev_x) if prev_x else None, self.role(prev_y) if prev_y else None)
+        prev = self._view()
         self.var = name
-        if v.ndim == 0:
+        self._settle(*prev)
+
+    def _view(self, kind: str | None = None, x: str | None = None, y: str | None = None) -> tuple:
+        """A view (the current one by default) with the roles of its axes, for :meth:`_settle`."""
+        if kind is None:
+            kind, x, y = self.kind, self.xdim, self.ydim
+        roles = tuple(self.role(d) if d in self.src.dims else None for d in (x, y))
+        return kind, x, y, roles
+
+    def _settle(self, prev_kind: str, prev_x: str | None, prev_y: str | None, prev_roles: tuple) -> None:
+        """Choose a view of the dimensions that aren't reduced, as near the previous one as they allow."""
+        live = self.live_dims()
+        if not live:
             self.kind, self.xdim, self.ydim = "scalar", None, None
             self.stack = []
             return
-        if v.ndim == 1:
-            self.kind, self.xdim, self.ydim = "line", v.dims[0], None
+        if len(live) == 1:
+            self.kind, self.xdim, self.ydim = "line", live[0], None
             self.stack = []
             return
         if prev_kind == "line" and self.stack and prev_roles[0] is not None:
-            line_dim = prev_x if prev_x in v.dims else self.role_dim(prev_roles[0])
+            line_dim = prev_x if prev_x in live else self.role_dim(prev_roles[0])
             if line_dim is not None and prev_roles[0] != OTHER:
                 self.kind, self.xdim, self.ydim = "line", line_dim, None
                 return
@@ -240,8 +300,8 @@ class Viewer:
         self.xdim, self.ydim = self._resolve_view(prev_x, prev_y, prev_roles)
 
     def _resolve_view(self, prev_x, prev_y, prev_roles) -> tuple[str, str]:
-        v = self.v
-        if prev_x in v.dims and prev_y in v.dims and prev_x != prev_y:
+        live = self.live_dims()
+        if prev_x in live and prev_y in live and prev_x != prev_y:
             return prev_x, prev_y
         if all(r is not None and r != OTHER for r in prev_roles):
             x, y = self.role_dim(prev_roles[0]), self.role_dim(prev_roles[1])
@@ -251,7 +311,8 @@ class Viewer:
         return views[0]
 
     def available_views(self) -> list[tuple[str, str]]:
-        if self.var is None or self.v.ndim < 2:
+        live = self.live_dims()
+        if len(live) < 2:
             return []
         out = []
         for xr_, yr_ in PRESET_VIEWS:
@@ -259,7 +320,7 @@ class Viewer:
             if x and y:
                 out.append((x, y))
         if not out:
-            out.append((self.v.dims[-1], self.v.dims[-2]))
+            out.append((live[-1], live[-2]))
         return out
 
     def view_name(self) -> str:
@@ -296,6 +357,9 @@ class Viewer:
         v = self.v
         if x not in v.dims or (y is not None and (y not in v.dims or y == x)):
             raise ValueError("choose two different dimensions of this variable")
+        for d in (x, y):
+            if d is not None and self.reduction(d) is not None:
+                raise ValueError(f"{d} is reduced ({self.reduction(d)}): restore it first")
         self.stack = []
         if y is None:
             self.kind, self.xdim, self.ydim = "line", x, None
@@ -304,7 +368,7 @@ class Viewer:
 
     def assign_axis(self, dim: str, axis: str) -> bool:
         """Put ``dim`` on the ``x`` or ``y`` axis of the current map, swapping if needed."""
-        if self.kind != "map" or dim not in self.v.dims:
+        if self.kind != "map" or dim not in self.live_dims():
             return False
         x, y = self.xdim, self.ydim
         if axis == "x":
@@ -315,7 +379,7 @@ class Viewer:
         return True
 
     def open_line(self, dim: str) -> bool:
-        if self.kind != "map" or dim not in self.v.dims:
+        if self.kind != "map" or dim not in self.live_dims():
             return False
         self.stack.append((self.kind, self.xdim, self.ydim))
         self.kind, self.xdim, self.ydim = "line", dim, None
@@ -324,12 +388,7 @@ class Viewer:
     def back(self) -> bool:
         if not self.stack:
             return False
-        kind, x, y = self.stack.pop()
-        v = self.v
-        roles = (self.role(x) if x in self.src.dims else None, self.role(y) if y in self.src.dims else None)
-        self.kind = kind
-        if v.ndim >= 2:
-            self.xdim, self.ydim = self._resolve_view(x, y, roles)
+        self._settle(*self._view(*self.stack.pop()))
         return True
 
     # ------------------------------------------------------------------ probe & zoom
@@ -550,14 +609,15 @@ class Viewer:
 
     def _index(self) -> tuple[tuple[str, Index], ...]:
         plotted = self.plotted()
-        return tuple((d, self.window(d) if d in plotted else self.pos(d)) for d in self.v.dims)
+        return tuple((d, self.window(d) if d in plotted else self.pos(d)) for d in self.live_dims())
 
     def anim_range_key(self) -> tuple | None:
-        """What the "anim" colour range depends on: the view, and the position of every other dim."""
+        """What the "anim" colour range depends on: the view, the position of every other
+        dim, and what is reduced. (variable, animated dim, index of the rest, reductions)"""
         dim = self.sweep_dim()
         if self.var is None or dim is None:
             return None
-        return (self.var, dim, tuple(item for item in self._index() if item[0] != dim))
+        return (self.var, dim, tuple(item for item in self._index() if item[0] != dim), self.reductions())
 
     def request(self) -> Request | None:
         if self.var is None:
@@ -576,6 +636,7 @@ class Viewer:
             colour=copy.copy(self.colour),
             options=replace(self.options),
             equal=self.equal_aspect(),
+            reduce=self.reductions(),
             anim_range=self.anim_ranges.get(key) if key is not None else None,
             anim_dim=self.sweep_dim(),
             selection=self.selection,
@@ -583,6 +644,15 @@ class Viewer:
 
     def position_label(self, dim: str) -> str:
         return self.src.dims[dim].label(self.pos(dim))
+
+    def snapshot(self) -> tuple:
+        """The variable, view, positions, zoom and reductions, to come back to with :meth:`restore`."""
+        return (self.var, self.kind, self.xdim, self.ydim, list(self.stack), dict(self._pos), dict(self._win),
+                dict(self._reduce))
+
+    def restore(self, snap: tuple) -> None:
+        self.var, self.kind, self.xdim, self.ydim = snap[:4]
+        self.stack, self._pos, self._win, self._reduce = list(snap[4]), dict(snap[5]), dict(snap[6]), dict(snap[7])
 
 
 def _spacing(values: np.ndarray) -> float | None:
