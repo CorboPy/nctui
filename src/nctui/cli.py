@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def plot_main(argv: list[str]) -> int:
+    from .data import STATS
+
     parser = argparse.ArgumentParser(
         prog="nctui plot",
         description="Print one plot to stdout and exit (a quick look for scripts and logs).",
@@ -63,6 +65,11 @@ def plot_main(argv: list[str]) -> int:
     parser.add_argument("--at", action="append", default=[], metavar="DIM=VALUE",
                         help="position along a dimension: a coordinate value, a date, or #index "
                              "(repeatable)")
+    for stat in STATS:
+        weighted = "; cos(lat)-weighted over a latitude in degrees" if stat == "mean" else ""
+        parser.add_argument(f"--{stat}", action="append", default=[], metavar="DIM",
+                            help=f"collapse a dimension to its {stat}, ignoring missing values{weighted} "
+                                 "(repeatable)")
     parser.add_argument("--x", metavar="DIM", help="dimension on the x axis")
     parser.add_argument("--y", metavar="DIM", help="dimension on the y axis (omit with --x for a line plot)")
     parser.add_argument("--cmap", help="colour map name")
@@ -88,12 +95,20 @@ def plot_main(argv: list[str]) -> int:
     viewer = Viewer(src)
     viewer.select_var(name)
     try:
+        chosen: dict[str, str] = {}
+        for stat in STATS:
+            for dim in getattr(args, stat):
+                if chosen.setdefault(dim, stat) != stat:
+                    raise ValueError(f"{dim}: give one statistic, not --{chosen[dim]} and --{stat}")
+                viewer.set_reduction(dim, stat)
         if args.x:
             viewer.set_axes(args.x, args.y)
         for item in args.at:
             dim, sep, value = item.partition("=")
             if not sep or dim not in src.dims:
                 raise ValueError(f"--at {item!r}: use DIM=VALUE with a dimension of {name}")
+            if viewer.reduction(dim) is not None:
+                raise ValueError(f"--at {item!r}: {dim} is reduced ({viewer.reduction(dim)}), it has no position")
             viewer.set_pos(dim, src.dims[dim].find(value))
     except ValueError as exc:
         print(f"nctui: {exc}", file=sys.stderr)
