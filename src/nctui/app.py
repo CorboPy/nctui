@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import threading
 import time
 from collections import deque
 
@@ -17,7 +18,7 @@ from textual.worker import get_current_worker
 
 from . import export
 from ._textual_fixes import patch_strip_divide, patch_strip_render
-from .data import TIME, Source, Z
+from .data import STATS, TIME, Source, Z
 from .frame import Frame, build_frame, short_name
 from .screens.colours import ColoursScreen
 from .screens.goto import GoToScreen
@@ -32,9 +33,18 @@ from .widgets.variables import VariableTree
 
 FPS_STEPS = [1, 2, 3, 5, 8, 12, 20, 30]
 READ_AHEAD = 4  # frames of data read ahead while animating
+STAT_LABELS = {"mean": "Mean", "min": "Minimum", "max": "Maximum", "sum": "Sum"}
 
 patch_strip_divide()
 patch_strip_render()
+
+
+def reduce_label(req) -> str:
+    """What is being worked out for ``req``, for the top bar: "mean over time, x"."""
+    by_stat: dict[str, list[str]] = {}
+    for dim, stat in req.reduce:
+        by_stat.setdefault(stat, []).append(short_name(dim))
+    return "; ".join(f"{stat} over {', '.join(dims)}" for stat, dims in by_stat.items())
 
 
 def human_size(n: int) -> str:
@@ -49,6 +59,7 @@ def human_size(n: int) -> str:
 class NctuiApp(App):
     TITLE = "nctui"
     ENABLE_COMMAND_PALETTE = False
+    REDUCE_QUIET = 0.3  # seconds a reduction runs before the top bar shows its progress
 
     CSS = """
     #topbar {
@@ -145,6 +156,10 @@ class NctuiApp(App):
         self._scan_shown = -1
         self._scan_key: tuple | None = None
         self._frozen = False
+        # the reduction the frame being built is reading: (its key, set this to stop it)
+        self._reducing: tuple[tuple, threading.Event] | None = None
+        self._reduce_shown = False  # its progress is in the top bar
+        self._drawn: tuple | None = None  # viewer.snapshot() of the plot on screen
 
     # ------------------------------------------------------------------ layout
 
@@ -240,39 +255,86 @@ class NctuiApp(App):
             return
         prefetch = []
         here = dict(req.index).get(self._anim_dim)
-        if self._anim_timer is not None and isinstance(here, int):
+        if self._anim_timer is not None and isinstance(here, int) and not req.reduce:
             # read the next few frames' data while this one is drawn (slow disks)
             size = self.src.dims[self._anim_dim].size
             for k in range(1, min(READ_AHEAD, size - 1) + 1):
                 idx = dict(req.index)
                 idx[self._anim_dim] = (here + k) % size
                 prefetch.append(idx)
-        self._pending = (req, w, h, prefetch)
+        self._pending = (req, w, h, prefetch, self.viewer.snapshot())
         if not self._building:
             self._start_next()
+        elif self._reducing is not None and self._reducing[0] != self._reduce_key(req):
+            self._reducing[1].set()  # the view moved on: stop reading a reduction nobody is waiting for
         if req.colour.mode == "anim" and req.anim_range is None:
             self._start_anim_range_scan()
+
+    def _reduce_key(self, req) -> tuple | None:
+        return self.src.reduce_key(req.var, req.index_dict(), req.reduce) if req.reduce else None
 
     def _start_next(self) -> None:
         if self._pending is None:
             return
         job, self._pending = self._pending, None
+        req = job[0]
         self._building = True
-        self._build(*job)
+        stop = threading.Event()
+        if req.reduce and not self.src.reduce_cached(req.var, req.index_dict(), req.reduce):
+            self._reducing = (self._reduce_key(req), stop)
+        self._build(*job, stop)
 
     @work(thread=True, group="frame", exit_on_error=False)
-    def _build(self, req, w, h, prefetch) -> None:
-        frame = build_frame(self.src, req, w, h)
-        self.call_from_thread(self._frame_done, frame)
+    def _build(self, req, w, h, prefetch, snap, stop: threading.Event) -> None:
+        started = time.monotonic()
+        label = reduce_label(req)
+        shown = -1
+
+        def progress(f: float) -> None:
+            nonlocal shown
+            pct = int(f * 100) // 10 * 10
+            if pct != shown and not stop.is_set() and time.monotonic() - started >= self.REDUCE_QUIET:
+                shown = pct
+                self.call_from_thread(self._reduce_progress, stop, f"{label} {pct}% · esc cancels")
+
+        frame = build_frame(self.src, req, w, h, progress, stop.is_set)
+        self.call_from_thread(self._frame_done, frame, snap)
         for idx in prefetch:
             try:
                 self.src.read(req.var, idx)  # cached reads return at once
             except Exception:  # noqa: BLE001 - prefetching is best effort
                 return
 
-    def _frame_done(self, frame: Frame) -> None:
+    def _reduce_progress(self, stop: threading.Event, text: str) -> None:
+        if self._reducing is not None and self._reducing[1] is stop and not stop.is_set():
+            self._reduce_shown = True
+            self._update_topbar(text)
+
+    def _cancel_reduce(self) -> bool:
+        """Stop the reduction being read and go back to the plot on screen."""
+        if self._reducing is None or self._drawn is None:
+            return False
+        self._reducing[1].set()
+        self._stop_animation()
+        var = self.viewer.var
+        self.viewer.restore(self._drawn)
+        if self.viewer.var != var:
+            self.query_one(VariableTree).highlight(self.viewer.var)
+        self.view_changed()
+        return True
+
+    def _frame_done(self, frame: Frame | None, snap: tuple | None = None) -> None:
         self._building = False
+        self._reducing = None
+        if self._reduce_shown:
+            self._reduce_shown = False
+            self._update_topbar()
+        if frame is None:  # its reduction was stopped: draw what is wanted now
+            self._start_next()
+            return
         self.last_frame = frame
+        if frame.error is None:
+            self._drawn = snap
         if not self._frozen:
             # everything alive after the first frame (Textual, the file's metadata) lives
             # for the whole session: keep it out of the garbage collector's full scans
@@ -368,6 +430,10 @@ class NctuiApp(App):
 
     def put_on_axis(self, dim: str, axis: str) -> None:
         viewer = self.viewer
+        stat = viewer.reduction(dim)
+        if stat is not None:
+            self.notify(f"{dim} is reduced ({stat}): restore it first", severity="warning", timeout=3)
+            return
         try:
             if viewer.kind == "map":
                 changed = viewer.assign_axis(dim, axis)
@@ -386,9 +452,19 @@ class NctuiApp(App):
             self.view_changed()
 
     def action_back(self) -> None:
-        if self._close_search():
+        if self._close_search() or self._cancel_reduce():
             return
         if self.viewer.back():
+            self.view_changed()
+
+    def set_reduction(self, dim: str, stat: str | None) -> None:
+        """Collapse ``dim`` with a statistic, or restore it (None)."""
+        try:
+            changed = self.viewer.set_reduction(dim, stat)
+        except ValueError as exc:
+            self.notify(str(exc), severity="warning")
+            return
+        if changed:
             self.view_changed()
 
     # ------------------------------------------------------------------ zoom
@@ -444,7 +520,7 @@ class NctuiApp(App):
         if dim is None:
             dim = viewer.step_targets()[0]
         if dim is None:
-            self._cant_play("can't play: every dimension is plotted")
+            self._cant_play("can't play: every dimension is plotted" + (" or reduced" if viewer.reductions() else ""))
             return
         self._start_animation(dim)
 
@@ -475,6 +551,9 @@ class NctuiApp(App):
         return queue is not None and queue.qsize() > 0
 
     def _start_animation(self, dim: str) -> None:
+        if self.viewer.reduction(dim) is not None:
+            self._cant_play(f"can't play: {short_name(dim)} is reduced")
+            return
         if self.src.dims[dim].size < 2:
             self._cant_play(f"can't play: only 1 {short_name(dim)} step")
             return
@@ -733,9 +812,8 @@ class NctuiApp(App):
         if viewer.var is None:
             return
         options: list[tuple[str, str]] = []
-        v = viewer.v
         if viewer.kind == "map":
-            order = sorted(v.dims, key=lambda d: {Z: 0, TIME: 1}.get(viewer.role(d), 2))
+            order = sorted(viewer.live_dims(), key=lambda d: {Z: 0, TIME: 1}.get(viewer.role(d), 2))
             for d in order:
                 role = viewer.role(d)
                 if role == Z:
@@ -745,6 +823,7 @@ class NctuiApp(App):
                 else:
                     label = f"Line along {d} here"
                 options.append((f"line:{d}", label))
+            options += self._reduce_options()
             options.append(("every", "Show every point around here (1)"))
             options.append(("zoom", "Zoom in here (+)"))
             plain = viewer.centring_axes(latitude=False)
@@ -758,12 +837,38 @@ class NctuiApp(App):
         elif viewer.kind == "line":
             if viewer.stack:
                 options.append(("back", "Back to the map (esc)"))
+            options += self._reduce_options()
             options.append(("every", "Show every point around here (1)"))
+        else:
+            options += self._reduce_options()
         if viewer.is_zoomed():
             options.append(("fit", "Fit the whole field (0)"))
         options += [("colours", "Colours… (c)"), ("settings", "Plot settings… (p)"),
                     ("save", "Save plot or animation… (e)")]
         self.push_screen(ActionMenu(self._probe_title(), options), self._menu_choice)
+
+    def _reduce_options(self) -> list[tuple[str, str]]:
+        """Menu entries to collapse each dimension with a statistic, or restore one that is."""
+        viewer = self.viewer
+        out = []
+        for d in viewer.v.dims:
+            stat = viewer.reduction(d)
+            out.append((f"reduce:{d}", f"Average over {d}…") if stat is None else
+                       (f"restore:{d}", f"Restore {d} ({stat})"))
+        return out
+
+    def _statistic_menu(self, dim: str) -> None:
+        """Choose the statistic ``dim`` is collapsed with."""
+        current = self.viewer.reduction(dim)
+        options = []
+        for stat in STATS:
+            label = STAT_LABELS[stat]
+            if stat == "mean" and self.src.dims[dim].is_lat:
+                label += " (cos(lat) weights)"
+            options.append((f"stat:{stat}:{dim}", label + (" ✓" if stat == current else "")))
+        if current is not None:
+            options.append((f"restore:{dim}", "Restore"))
+        self.push_screen(ActionMenu(f"{dim}: reduce to its", options), self._menu_choice)
 
     def action_variable_menu(self) -> None:
         tree = self.query_one(VariableTree)
@@ -788,6 +893,11 @@ class NctuiApp(App):
         if d is None:
             return
         viewer = self.viewer
+        stat = viewer.reduction(d)
+        if stat is not None:  # no position, axis or animation: only the way back
+            options = [(f"restore:{d}", f"Restore {d}"), (f"reduce:{d}", f"Statistic… ({stat})")]
+            self.push_screen(ActionMenu(f"{d} · {stat}", options), self._menu_choice)
+            return
         options: list[tuple[str, str]] = []
         if viewer.kind == "map":
             if d != viewer.xdim:
@@ -797,6 +907,7 @@ class NctuiApp(App):
             role = viewer.role(d)
             kind = "Vertical profile" if role == Z else "Time series" if role == TIME else "Line"
             options.append((f"line:{d}", f"{kind} along {d} at the probe"))
+        options.append((f"reduce:{d}", f"Average over {d}…"))
         if d in viewer.free_dims():
             options.append((f"anim:{d}", f"Animate along {d} (space)"))
             options.append((f"first:{d}", "Go to the first"))
@@ -813,6 +924,13 @@ class NctuiApp(App):
             if viewer.open_line(arg):
                 self.query_one(PlotView).focus()
                 self.view_changed()
+        elif key == "reduce":
+            self._statistic_menu(arg)
+        elif key == "stat":
+            stat, _, dim = arg.partition(":")
+            self.set_reduction(dim, stat)
+        elif key == "restore":
+            self.set_reduction(arg, None)
         elif key == "every":
             self.action_every_point()
         elif key == "zoom":

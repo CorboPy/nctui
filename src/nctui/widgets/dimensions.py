@@ -1,4 +1,8 @@
-"""The dimensions pane: one entry per dimension of the current variable."""
+"""The dimensions pane: one entry per dimension of the current variable.
+
+A plotted dimension shows its window and the probe, a free one its position, and
+one collapsed by a statistic (``time  mean``) just that: it has no position.
+"""
 
 from __future__ import annotations
 
@@ -77,7 +81,13 @@ class DimensionPanel(Widget, can_focus=True):
             name_style = "bold reverse" if selected else "bold"
             line1 = Text(no_wrap=True)
             line1.append(d[: width - 12], style=name_style)
-            if d in plotted:
+            stat = viewer.reduction(d)
+            if stat is not None:
+                pad = max(1, width - len(line1.plain) - len(stat))
+                line1.append(" " * pad)
+                line1.append(stat, style="bold yellow")
+                line2 = Text(f"  over all {src.file_size(d)}", style="dim")
+            elif d in plotted:
                 if viewer.kind == "map":
                     axis = "x" if d == viewer.xdim else "y"
                     tag = f"plot {axis}"
@@ -122,6 +132,8 @@ class DimensionPanel(Widget, can_focus=True):
         if d is None:
             return
         viewer = self.nctui.viewer
+        if viewer.reduction(d) is not None:
+            return  # collapsed: nothing to step
         if d in viewer.plotted():
             # stepping a plotted dimension moves the probe along it
             if viewer.step(d, delta * viewer.probe_step(d), wrap=True):
@@ -161,7 +173,7 @@ class DimensionPanel(Widget, can_focus=True):
         self.cursor = row
         d = dims[row]
         viewer = self.nctui.viewer
-        if offset.y % 2 == 0 and d not in viewer.plotted():
+        if offset.y % 2 == 0 and d not in viewer.plotted() and viewer.reduction(d) is None:
             width = self.content_size.width
             counter_len = len(f"◀ {viewer.pos(d) + 1:>{len(str(viewer.src.dims[d].size))}}"
                               f"/{viewer.src.dims[d].size} ▶")

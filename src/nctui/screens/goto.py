@@ -71,7 +71,7 @@ class GoToScreen(ModalScreen[None]):
             yield Label("Type a value, a date, #index, or for plotted axes a range like 0:2000.",
                         classes="hint")
             with Grid():
-                for d in viewer.v.dims:
+                for d in viewer.live_dims():  # a reduced dimension has nowhere to go
                     dim = src.dims[d]
                     if d in plotted:
                         a, b = viewer.window(d)
@@ -98,6 +98,8 @@ class GoToScreen(ModalScreen[None]):
         changes: list[tuple[str, str, object]] = []
         try:
             for i, d in enumerate(viewer.v.dims):
+                if viewer.reduction(d) is not None:
+                    continue
                 text = self.query_one(f"#dim-{i}", Input).value
                 dim = src.dims[d]
                 if d in plotted:

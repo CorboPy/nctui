@@ -53,7 +53,7 @@ class PlotSettingsScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         viewer = self.nctui.viewer
-        dims = list(viewer.v.dims) if viewer.var else []
+        dims = viewer.live_dims()  # a reduced dimension can't go on an axis
         opts = viewer.options
         with VerticalScroll() as box:
             box.border_title = "plot settings"
