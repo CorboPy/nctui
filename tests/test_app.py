@@ -824,3 +824,24 @@ async def test_save_a_reduced_plot(app, tmp_path):
         app.screen.query_one("#file").value = str(out)
         await pilot.press("enter")
         assert await wait_for(pilot, out.exists)
+
+
+async def test_every_dimension_reduced_shows_one_number_and_can_be_restored(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        for d in app.viewer.v.dims:
+            app.set_reduction(d, "min")
+        await settle(pilot, app)
+        assert app.last_frame.error is None and app.last_frame.probe_value == 0.0
+        assert app.last_frame.header == "value · time min · full_levels min · y min · x min"
+        app.query_one(PlotView).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        options = _options(app)
+        assert options["restore:time"] == "Restore time (min)" and not any(k.startswith("line:") for k in options)
+        app.screen.dismiss("restore:time")
+        await settle(pilot, app)
+        assert app.last_frame.header == "time series along time · full_levels min · y min · x min"
+        await pilot.press("g", "escape", "p", "escape")  # the popups cope with one dimension left
+        await settle(pilot, app)
+        assert app.last_frame.error is None

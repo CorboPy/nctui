@@ -77,3 +77,10 @@ def test_plot_rejects_bad_reductions(cartesian, capsys):
     assert code == 1 and "time is reduced" in err
     code, _, err = _plot(capsys, cartesian, "-v", "theta", "--mean", "time", "--x", "time")
     assert code == 1 and "restore it first" in err
+
+
+def test_plot_mean_over_joined_files(split_files, capsys):
+    code, out, _ = _plot(capsys, *split_files, "-v", "theta", "--mean", "time")
+    assert code == 0
+    assert "map y–x · time mean · full_levels 0" in out
+    assert "min 2500  max 2546" in out  # 1000 × the mean of time steps 0…5, across the three files
