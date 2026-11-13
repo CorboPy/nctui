@@ -8,7 +8,7 @@ from nctui.app import NctuiApp
 from nctui.data import Source
 from nctui.screens.colours import ColoursScreen
 from nctui.screens.info import HelpScreen, InfoScreen
-from nctui.screens.menu import ActionMenu
+from nctui.screens.menu import ActionMenu, Entry
 from nctui.screens.save import SaveScreen
 from nctui.screens.settings import PlotSettingsScreen
 from nctui.widgets.plot import PlotView
@@ -74,6 +74,30 @@ async def test_view_cycle_and_swap(app):
         await pilot.press("t")
         await settle(pilot, app)
         assert app.viewer.xdim == "full_levels"
+
+
+def _options(app):
+    return {e.id: e.label for e in app.screen.entries.values()}
+
+
+async def test_menus_share_sections_and_show_keys(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.query_one(PlotView).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [name for name, _ in app.screen.sections] == ["Here", "Reduce", "View", "Plot"]
+        assert not any(k.startswith("reduce:") for k in _options(app))  # one entry, not one per dimension
+        assert app.screen.entries["zoom"].key == "+"
+        assert not app.screen.entries["fit"].enabled  # greyed out, not hidden
+        await pilot.press("escape")
+        dims = app.query_one("DimensionPanel")
+        dims.cursor = dims.dims().index("projection_x_coordinate")
+        dims.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [name for name, _ in app.screen.sections] == ["Here", "Reduce", "View", "Plot"]
+        assert not app.screen.entries["x:projection_x_coordinate"].enabled
 
 
 async def test_profile_through_probe_and_back(app):
@@ -294,8 +318,10 @@ async def test_centre_the_map_from_the_plot_menu(latlon):
         app.query_one(PlotView).focus()
         await pilot.press("enter")
         await pilot.pause()
-        ids = [o.id for o in app.screen.query_one("OptionList")._options]
-        assert "centre" in ids
+        assert _options(app)["uncentre"] == "Undo centring" and not app.screen.entries["uncentre"].enabled
+        app.screen.dismiss("centre_menu")  # longitude alone, or latitude too
+        await pilot.pause()
+        assert "centre" in _options(app)
         app.screen.dismiss("centre")
         await settle(pilot, app)
         assert app.viewer.src.centre("longitude") is not None
@@ -311,9 +337,10 @@ async def test_centre_with_latitude_from_the_plot_menu(latlon):
         app.query_one(PlotView).focus()
         await pilot.press("enter")
         await pilot.pause()
-        options = {o.id: str(o.prompt) for o in app.screen.query_one("OptionList")._options}
-        assert options["centre"] == "Centre here: longitude"
-        assert options["centre_lat"] == "Centre here: longitude + latitude"
+        assert _options(app)["centre_menu"] == "Centre here…"
+        app.screen.dismiss("centre_menu")
+        await pilot.pause()
+        assert _options(app) == {"centre": "longitude", "centre_lat": "longitude + latitude"}
         app.screen.dismiss("centre_lat")
         await settle(pilot, app)
         assert app.viewer.src.centre("latitude") == 60.0
@@ -598,8 +625,6 @@ async def test_manual_range_boxes_appear_for_manual_and_apply_on_tab(app):
 # --------------------------------------------------------------------------- reducing over dimensions
 
 
-def _options(app):
-    return {o.id: str(o.prompt) for o in app.screen.query_one("OptionList")._options}
 
 
 def _pane(app):
@@ -613,7 +638,7 @@ async def test_average_over_time_from_the_dimension_menu_and_restore(app):
         await pilot.press("tab")  # Variables → Dimensions, cursor on time
         await pilot.press("enter")
         await pilot.pause()
-        assert _options(app)["reduce:time"] == "Average over time…"
+        assert _options(app)["reduce:time"] == "Reduce time…"
         app.screen.dismiss("reduce:time")
         await pilot.pause()
         assert isinstance(app.screen, ActionMenu)  # the statistics to choose from
@@ -634,7 +659,9 @@ async def test_average_over_time_from_the_dimension_menu_and_restore(app):
         # the same menu restores it, where it was
         await pilot.press("enter")
         await pilot.pause()
-        assert _options(app) == {"restore:time": "Restore time", "reduce:time": "Statistic… (mean)"}
+        assert [name for name, _ in app.screen.sections] == ["Reduce", "Plot"]
+        assert dict(app.screen.sections)["Reduce"] == [Entry("restore:time", "Restore time"),
+                                                      Entry("reduce:time", "Statistic… (mean)")]
         await pilot.press("enter")
         await settle(pilot, app)
         assert app.viewer.reductions() == () and app.viewer.pos("time") == 1
@@ -649,7 +676,9 @@ async def test_zonal_mean_from_the_plot_menu_then_a_profile_of_it(latlon):
         app.query_one(PlotView).focus()
         await pilot.press("enter")
         await pilot.pause()
-        assert _options(app)["reduce:longitude"] == "Average over longitude…"
+        app.screen.dismiss("reduce_pick")
+        await pilot.pause()
+        assert _options(app)["reduce:longitude"] == "longitude"
         app.screen.dismiss("reduce:longitude")
         await pilot.pause()
         app.screen.dismiss("stat:mean:longitude")
@@ -662,7 +691,7 @@ async def test_zonal_mean_from_the_plot_menu_then_a_profile_of_it(latlon):
         options = _options(app)
         assert "line:longitude" not in options  # no line along a collapsed dimension
         assert options["restore:longitude"] == "Restore longitude (mean)"
-        assert options["reduce:latitude"] == "Average over latitude…"
+        assert "reduce_pick" in options
         app.screen.dismiss("line:level_height")
         await settle(pilot, app)
         assert app.last_frame.header.startswith("profile along level_height at latitude=0 · ")
