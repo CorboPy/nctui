@@ -505,3 +505,13 @@ def test_blocks_stay_within_the_budget_when_kept_dimensions_are_large(gappy, mon
     assert out.shape == tuple(n for n, d in zip(sst.shape, ("time", "lat", "lon"), strict=True)
                               if d not in dict(reduce))
     assert seen[-1] == 1.0 and seen == sorted(seen)
+
+
+def test_value_range_of_a_reduced_field_without_a_sweep(cartesian):
+    """With nothing to sweep, the range is of the reduced field, not of the raw values."""
+    src = Source(cartesian)
+    means = _values(cartesian, "theta").mean(axis=0)
+    assert src.value_range("theta", reduce=(("time", "mean"),)) == (means.min(), means.max())
+    assert src.value_range("theta", {"full_levels": 2}, reduce=(("time", "mean"),)) == (means[2].min(), means[2].max())
+    fresh = Source(cartesian)  # nothing cached, so there is something to cancel
+    assert fresh.value_range("theta", reduce=(("time", "mean"),), cancelled=lambda: True) is None

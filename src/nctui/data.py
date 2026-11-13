@@ -9,6 +9,7 @@ read from disk.
 from __future__ import annotations
 
 import itertools
+import math
 import os
 import re
 import threading
@@ -1018,7 +1019,7 @@ class Source:
         last_stat, last = groups[-1]  # the group with the outermost dimension: summed up block by block
         axes = [d for d in v.dims if d not in fixed]
         whole = {d: (0, self.file_size(d)) for d in axes}
-        nbytes = 8.0 * float(np.prod([self.file_size(d) for d in axes]))
+        nbytes = 8.0 * math.prod(self.file_size(d) for d in axes)  # Python ints: no overflow
         # tile the dimensions kept in the result and those of the last group, outermost first,
         # until a block is small enough (an earlier group has to be read whole to be collapsed)
         kept = [d for d in axes if d not in stats]
@@ -1085,13 +1086,18 @@ class Source:
 
         The other dimensions are indexed by ``index`` (a position, or a window as
         in :meth:`read`), or collapsed as ``reduce`` says. With no ``sweep``, the
-        whole variable. Reads one slice at a time; returns None if cancelled or
-        there is no finite data.
+        whole variable (or, with ``reduce``, the reduced field ``index`` selects).
+        Reads one slice at a time; returns None if cancelled or there is no finite data.
         """
         v = self.vars[var]
         if v.ndim == 0:
             val = float(np.asarray(self.read(var, {})).reshape(-1)[0])
             return (val, val)
+        if sweep is None and reduce:  # nothing to step through: the range of the reduced field itself
+            field = self.reduce_read(var, index or {}, reduce, progress, cancelled)
+            if field is None or not np.isfinite(field).any():
+                return None
+            return float(np.nanmin(field)), float(np.nanmax(field))
         whole = sweep is None
         if whole:
             sweep = v.dims[0]
