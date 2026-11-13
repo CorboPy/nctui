@@ -467,3 +467,41 @@ def test_value_range_of_a_reduced_view(cartesian):
     assert rng == (means.min(), means.max())
     assert seen[-1] == 1.0 and seen == sorted(seen)
     assert src.reduce_cached("theta", {"full_levels": 4}, (("time", "mean"),))  # an animation reads these next
+
+
+def test_same_statistic_collapses_together_across_a_kept_dimension(gappy):
+    """time and lon are not neighbours in (time, lat, lon), but one mean still covers both."""
+    src = Source(gappy)
+    sst = _values(gappy, "sst")
+    out = src.reduce_read("sst", {}, (("time", "mean"), ("lon", "mean")))
+    np.testing.assert_allclose(out, _nan(np.nanmean, sst, (0, 2)))
+    mean_of_means = _nan(np.nanmean, _nan(np.nanmean, sst, 2), 0)
+    assert not np.allclose(out, mean_of_means, equal_nan=True)  # which is what separate groups would give
+
+
+@pytest.mark.parametrize("reduce", [(("lon", "mean"),), (("lat", "max"),), (("time", "sum"), ("lon", "sum")),
+                                    (("time", "min"),)])
+def test_blocks_stay_within_the_budget_when_kept_dimensions_are_large(gappy, monkeypatch, reduce):
+    """A zonal mean of a long time × lat field is tiled over time and lat too, not read in one go."""
+    from nctui import data
+
+    sst = _values(gappy, "sst")
+    whole = Source(gappy).reduce_read("sst", {}, reduce)
+    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 6 * 2)
+    src = Source(gappy)
+    sizes = []
+    read = src._slice
+
+    def spy(*args):
+        out = read(*args)
+        sizes.append(out.nbytes)
+        return out
+
+    monkeypatch.setattr(src, "_slice", spy)
+    seen = []
+    out = src.reduce_read("sst", {}, reduce, progress=seen.append)
+    assert max(sizes) <= 8 * 6 * 2 and len(sizes) > 1
+    np.testing.assert_allclose(out, whole)
+    assert out.shape == tuple(n for n, d in zip(sst.shape, ("time", "lat", "lon"), strict=True)
+                              if d not in dict(reduce))
+    assert seen[-1] == 1.0 and seen == sorted(seen)

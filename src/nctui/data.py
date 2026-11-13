@@ -927,9 +927,10 @@ class Source:
         last dimension to its first (space before time).
 
         The data is read a block at a time (see :data:`REDUCE_BLOCK_BYTES`) through the
-        slice cache. The result is kept for the whole of the windowed dimensions, so
-        zooming, scrolling and centring afterwards don't read again. Returns None if
-        cancelled.
+        slice cache, tiling the dimensions kept as well as those collapsed last; only
+        dimensions collapsed first, under a different statistic, are read whole. The
+        result is kept for the whole of the windowed dimensions, so zooming, scrolling
+        and centring afterwards don't read again. Returns None if cancelled.
         """
         if not reduce:
             return self.read(var, index)
@@ -1018,15 +1019,22 @@ class Source:
         axes = [d for d in v.dims if d not in fixed]
         whole = {d: (0, self.file_size(d)) for d in axes}
         nbytes = 8.0 * float(np.prod([self.file_size(d) for d in axes]))
-        spans = {d: [whole[d]] for d in last}
-        for d in last:  # outermost first, split until a block is small enough
+        # tile the dimensions kept in the result and those of the last group, outermost first,
+        # until a block is small enough (an earlier group has to be read whole to be collapsed)
+        kept = [d for d in axes if d not in stats]
+        tiled = [d for d in axes if d in kept or d in last]
+        spans = {d: [whole[d]] for d in tiled}
+        for d in tiled:
             n = self.file_size(d)
             if nbytes <= REDUCE_BLOCK_BYTES or n == 0:
                 break
             step = max(1, int(REDUCE_BLOCK_BYTES // (nbytes / n)))
             spans[d] = [(a, min(n, a + step)) for a in range(0, n, step)]
             nbytes = nbytes / n * step
-        blocks = list(itertools.product(*(spans[d] for d in last)))
+        blocks = list(itertools.product(*(spans[d] for d in tiled)))
+        shape = [self.file_size(d) for d in kept]
+        extreme = last_stat in ("min", "max")
+        acc = (np.full(shape, np.nan), None) if extreme else (np.zeros(shape), np.zeros(shape))
 
         def weights(dims: list[str], stat: str, names: list[str], norm: Mapping[str, Index]) -> np.ndarray | None:
             lat = next((d for d in dims if self.dims[d].is_lat), None) if stat == "mean" else None
@@ -1037,17 +1045,17 @@ class Source:
             w = np.clip(np.cos(np.deg2rad(self._stored_values.get(lat, self.dims[lat].values)[a:b])), 0.0, None)
             return w.reshape([-1 if n == lat else 1 for n in names])
 
-        acc = None
         for k, block in enumerate(blocks):
             if cancelled is not None and cancelled():
                 return None
             norm: dict[str, Index] = {**fixed, **whole}
-            for d, (a, b) in zip(last, block, strict=True):
-                norm[d] = a if b - a == 1 else (a, b)  # one step: the slice a map of it reads too
+            for d, (a, b) in zip(tiled, block, strict=True):
+                # one step of a reduced dimension: the slice a map of it reads too
+                norm[d] = a if b - a == 1 and d in last else (a, b)
             data = self.read(v.name, norm, stored=True)
             for i, d in enumerate(axes):
                 if isinstance(norm[d], int):
-                    data = np.expand_dims(data, i)
+                    data = np.expand_dims(data, i)  # keep its axis, to collapse below
             names = list(axes)
             for stat, dims in groups[:-1]:
                 part = _partial(data, tuple(names.index(d) for d in dims), stat, weights(dims, stat, names, norm))
@@ -1055,7 +1063,11 @@ class Source:
                 names = [n for n in names if n not in dims]
             part = _partial(data, tuple(names.index(d) for d in last), last_stat,
                             weights(last, last_stat, names, norm))
-            acc = part if acc is None else _merge(acc, part, last_stat)
+            here = tuple(slice(*norm[d]) for d in kept)  # this block's part of the result
+            merged = _merge((acc[0][here], None if extreme else acc[1][here]), part, last_stat)
+            acc[0][here] = merged[0]
+            if not extreme:
+                acc[1][here] = merged[1]
             if progress is not None:
                 progress((k + 1) / len(blocks))
         return _finish(acc, last_stat)

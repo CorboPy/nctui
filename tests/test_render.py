@@ -300,7 +300,7 @@ def test_reduced_frame_with_zoom_centring_and_mirroring(latlon):
 def test_build_frame_reports_progress_and_can_be_cancelled(cartesian, monkeypatch):
     from nctui import data
 
-    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 1)  # one time step per block
+    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 5 * 7)  # one time step of the map per block
     src = Source(cartesian)
     v = Viewer(src)
     v.select_var("theta")
