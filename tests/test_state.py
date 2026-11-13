@@ -226,3 +226,146 @@ def test_centre_here_with_latitude_puts_the_probe_in_the_middle(latlon):
         == value
     assert v.uncentre()
     assert (v.pos("latitude"), v.pos("longitude")) == (7, 2)
+
+
+# --------------------------------------------------------------------------- reducing over dimensions
+
+T, Z, Y, X = "time", "full_levels", "projection_y_coordinate", "projection_x_coordinate"
+
+
+def test_reducing_a_free_dimension_keeps_the_view(viewer):
+    viewer.set_pos(T, 2)
+    assert viewer.set_reduction(T, "mean")
+    assert not viewer.set_reduction(T, "mean")  # nothing to change
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", X, Y)
+    assert viewer.reduction(T) == "mean" and viewer.reductions() == ((T, "mean"),)
+    assert viewer.live_dims() == [Z, Y, X] and viewer.free_dims() == [Z]
+    req = viewer.request()
+    assert req.reduce == ((T, "mean"),)
+    assert [d for d, _ in req.index] == [Z, Y, X]  # no position along a collapsed dimension
+    # restoring it puts it back where it was
+    assert viewer.set_reduction(T, None)
+    assert viewer.reductions() == () and viewer.pos(T) == 2
+    assert viewer.request().reduce == ()
+
+
+def test_a_reduced_dimension_cant_be_stepped_plotted_or_animated(viewer):
+    viewer.set_reduction(T, "max")
+    assert viewer.step_targets() == (Z, None)  # [ ] now step the level
+    assert viewer.sweep_dim() == Z
+    assert not viewer.step(T, 1) and not viewer.step(T, 1, wrap=True) and not viewer.set_pos(T, 3)
+    assert viewer.pos(T) == 0
+    assert not viewer.assign_axis(T, "x") and not viewer.open_line(T)
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", X, Y)
+    with pytest.raises(ValueError, match="restore it first"):
+        viewer.set_axes(T, Z)
+    with pytest.raises(ValueError, match="restore it first"):
+        viewer.set_axes(Z, T)
+    for _ in range(4):
+        viewer.cycle_view()
+        assert T not in viewer.plotted()
+
+
+def test_reducing_a_plotted_dimension_changes_the_view(viewer):
+    viewer.set_reduction(X, "mean")  # the "zonal" mean of a y–x map: a z–y section
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", Y, Z)
+    assert viewer.free_dims() == [T]
+    assert viewer.available_views() == [(Y, Z)]
+    viewer.set_reduction(Y, "mean")  # time and level left: no preset view, the last two dimensions
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", Z, T)
+    viewer.set_reduction(Z, "mean")  # the domain-mean time series
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("line", T, None)
+    assert viewer.free_dims() == [] and viewer.step_targets() == (None, None)
+    viewer.set_reduction(T, "mean")  # nothing left: one number
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("scalar", None, None)
+    assert viewer.request().index == () and len(viewer.request().reduce) == 4
+    # coming back: a line when one dimension is left, a map with two
+    viewer.set_reduction(Z, None)
+    assert (viewer.kind, viewer.xdim) == ("line", Z)
+    viewer.set_reduction(X, None)
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", X, Z)
+
+
+def test_restoring_keeps_a_view_that_still_stands(viewer):
+    viewer.set_reduction(X, "mean")
+    viewer.set_reduction(X, None)
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", Y, Z)  # x is back, as a free dimension
+    assert viewer.free_dims() == [T, X]
+
+
+def test_reducing_a_profiles_own_dimension_goes_back_to_the_map(viewer):
+    viewer.open_line(Z)
+    viewer.set_reduction(T, "mean")  # a free dimension: still the profile
+    assert (viewer.kind, viewer.xdim) == ("line", Z) and viewer.stack
+    viewer.set_reduction(Z, "mean")  # the vertical mean, on the map the profile came from
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", X, Y) and not viewer.stack
+
+
+def test_back_from_a_profile_when_the_maps_dimension_was_reduced(viewer):
+    viewer.open_line(Z)
+    viewer.set_reduction(X, "mean")
+    assert viewer.back()
+    assert viewer.kind == "map" and X not in viewer.plotted()
+
+
+def test_reductions_carry_over_to_other_variables(viewer):
+    viewer.set_reduction(T, "mean")
+    viewer.set_reduction(Z, "max")
+    viewer.select_var("rho")  # on half_levels: its vertical dimension is reduced the same way
+    assert viewer.reductions() == ((T, "mean"), ("half_levels", "max"))
+    assert (viewer.kind, viewer.xdim, viewer.ydim) == ("map", X, Y)
+    viewer.select_var("forecast_period")  # only has time: one number
+    assert viewer.kind == "scalar" and viewer.reductions() == ((T, "mean"),)
+    viewer.select_var("theta")
+    assert viewer.reductions() == ((T, "mean"), (Z, "max"))
+    assert viewer.kind == "map"
+
+
+def test_reductions_are_part_of_the_animation_range_key(viewer):
+    plain = viewer.anim_range_key()
+    viewer.set_reduction(T, "mean")
+    mean = viewer.anim_range_key()
+    assert mean[1] == Z  # the animation now runs along the level
+    viewer.set_reduction(T, "max")
+    assert len({plain, mean, viewer.anim_range_key()}) == 3
+    viewer.anim_ranges[mean] = (0.0, 1.0)
+    assert viewer.request().anim_range is None  # the mean's range isn't the max's
+    viewer.set_reduction(T, "mean")
+    assert viewer.request().anim_range == (0.0, 1.0)
+
+
+def test_unknown_statistic_or_dimension(viewer):
+    with pytest.raises(ValueError):
+        viewer.set_reduction(T, "median")
+    with pytest.raises(ValueError):
+        viewer.set_reduction("half_levels", "mean")
+
+
+def test_snapshot_and_restore(viewer):
+    viewer.set_pos(Z, 3)
+    viewer.zoom(2)
+    snap = viewer.snapshot()
+    before = viewer.request()
+    viewer.set_reduction(X, "mean")
+    viewer.set_reduction(T, "sum")
+    viewer.set_pos(T, 1)
+    viewer.select_var("rho")
+    viewer.restore(snap)
+    assert viewer.request() == before
+    assert viewer.reductions() == ()
+
+
+def test_zoom_and_centring_dont_change_what_is_reduced(latlon):
+    v = Viewer(Source(latlon))
+    v.select_var("air_temperature")
+    v.set_reduction("time", "mean")
+    key = v.src.reduce_key("air_temperature", v.request().index_dict(), v.request().reduce)
+    v.zoom(2)
+    v.centre_here(latitude=True)
+    req = v.request()
+    assert req.reduce == (("time", "mean"),)
+    assert v.src.reduce_key("air_temperature", req.index_dict(), req.reduce) == key
+    # reducing the centred longitude takes it off the plot; its centring stays for when it comes back
+    v.set_reduction("longitude", "mean")
+    assert (v.xdim, v.ydim) == ("latitude", "level_height")
+    assert v.src.centre("longitude") is not None

@@ -63,7 +63,7 @@ view.
 | `v` | cycle views: map → section (z–x) → section (z–y) |
 | `t` | swap the plot axes |
 | `space`, `<` `>` | play / pause animation, slower / faster |
-| `enter` | actions for whatever is selected (profile, time series, …) |
+| `enter` | actions for whatever is selected (profile, time series, average over a dimension, …) |
 | `+` `-` | zoom in / out around the probe; or drag a box with the mouse |
 | `1` / `0` | show every data point around the probe / fit the whole field |
 | `f` | full-width plot (hide the left panes) |
@@ -107,13 +107,52 @@ the south pole at the top. Centred on -90 it mirrors about the south pole instea
 the north pole is at both the top and the bottom. *Centre here: longitude + latitude*
 in the enter menu centres both on the probe.
 
+### Averaging over a dimension
+
+Any dimension can be collapsed with a statistic, for a zonal mean, a time mean, a
+vertical mean or a domain-mean time series. Press `enter` on the plot, or on a
+dimension in the Dimensions pane, and choose *Average over <dim>…*, then *Mean*,
+*Minimum*, *Maximum* or *Sum*.
+
+- The Dimensions pane shows a reduced dimension as `time  mean`. It has no
+  position, so it can't be stepped, animated or put on an axis. `enter` on it
+  restores it (or changes the statistic), and it comes back where it was.
+- Reducing a dimension that is on the plot changes the view to what is left: the
+  zonal mean of a lat–lon map is a latitude–level section, and with latitude and
+  longitude both reduced you get a time series (a map against level if the
+  variable has levels). Reduce everything and you get the one number.
+- Reductions stay when you change variable, like your place does: a vertical mean
+  over `full_levels` is a vertical mean over `half_levels` too.
+- Missing values are ignored, and a point with nothing but missing values stays
+  missing.
+- A mean over a latitude in degrees is weighted by cos(latitude). The status line
+  says which was used: `cos(lat)-weighted mean` or `unweighted mean`. Nothing
+  else is weighted: time steps count equally, whatever their length, and a
+  vertical mean or sum is over levels, not mass or height.
+- Dimensions reduced with the same statistic are collapsed together, so a mean
+  over latitude and longitude is one area-weighted mean of every valid point.
+  Different statistics are applied from the variable's last dimension to its first
+  (so space before time): *Mean* over longitude with *Maximum* over time is the
+  largest zonal mean.
+- A dimension is always reduced over its whole length, each point once, however
+  the plot is zoomed or centred. Zoom, the probe, line plots, centring and
+  *min/max: fit animation* all work on the reduced field.
+
+The file is read a block at a time, off the screen's thread. A reduction that takes
+a moment shows its progress in the top bar (`mean over time 40% · esc cancels`);
+`esc` stops it and goes back to the plot you had. The result is kept, so zooming,
+scrolling and centring afterwards are instant, but each new level (or time) of a
+reduced view is read when you first go there.
+
 ### Saving a figure or an animation
 
 Get the plot looking the way you want, then press `e`. The dialog is filled in
 from the current view; you can change the file name, title, size and dpi. The image
 is drawn by matplotlib with your colour map, range, view, zoom and coastlines, using
-**every data point**, not the reduced version on screen. Name the file `.pdf` or
-`.svg` for those formats.
+**every data point**, not the reduced version on screen. A mean (or other
+statistic) over a dimension is worked out from the file's data too, and the title
+and file name say what was reduced. Name the file `.pdf` or `.svg` for those
+formats.
 
 Choose *animation* in the same dialog to save every step along the animated dimension as a movie, at your playback speed.
 You can pick the first and last frame and the frame rate. Each frame's title gets
@@ -156,6 +195,17 @@ nctui plot FILE -v theta --at time=#3 --at full_levels=120.5
 prints the same plot to stdout and exits, which is handy in scripts and job logs.
 `--x`/`--y` choose the axes (give only `--x` for a line plot), `--cmap` picks a
 colour map, and `--width`/`--height` set the size.
+
+`--mean DIM`, `--min DIM`, `--max DIM` and `--sum DIM` reduce over a dimension, and
+can be repeated:
+
+```bash
+nctui plot FILE -v tas --mean time                 # time-mean map
+```
+
+```bash
+nctui plot FILE -v tas --mean lat --mean lon       # global-mean time series
+```
 
 ## Development
 

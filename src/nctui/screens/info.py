@@ -100,7 +100,7 @@ HELP = [
         ("↑ ↓", "Variables: choose a variable (it plots as you go)"),
         ("/", "search variables by name, long_name or standard_name"),
         ("enter", "actions for whatever is selected"),
-        ("esc", "close a popup, or go back from a line plot to the map"),
+        ("esc", "close a popup, go back from a line plot to the map, or cancel a reduction"),
     ]),
     ("Slicing", [
         ("[ ]", "step time back / forward (wraps round)"),
@@ -110,6 +110,7 @@ HELP = [
         ("v", "cycle views: map → section (z–x) → section (z–y)"),
         ("t", "swap the plot axes"),
         ("g", "go to a value: type a date, a height, #index, or a range like 0:2000"),
+        ("enter", "Dimensions or Plot: average over a dimension (mean, min, max, sum), or restore it"),
         ("space", "play / pause animation (along time, or the highlighted dimension)"),
         ("< >", "slower / faster animation"),
     ]),

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -59,7 +60,24 @@ class Frame:
     error: str | None = None
 
 
+class Cancelled(Exception):
+    """The work was cancelled part way."""
+
+
 # --------------------------------------------------------------------------- helpers
+
+
+def request_data(src: Source, req: Request, progress: Callable[[float], None] | None = None,
+                 cancelled: Callable[[], bool] | None = None) -> np.ndarray:
+    """The data ``req`` shows, from every data point: its part of the variable, reduced as it asks.
+
+    ``progress`` and ``cancelled`` are for a reduction that has to be read (see
+    :meth:`Source.reduce_read`); raises :class:`Cancelled` if it is stopped.
+    """
+    data = src.reduce_read(req.var, req.index_dict(), req.reduce, progress, cancelled)
+    if data is None:
+        raise Cancelled
+    return data
 
 
 def short_name(dim: str) -> str:
@@ -178,35 +196,49 @@ def _value_text(v: float | None, units: str) -> str:
 # --------------------------------------------------------------------------- builders
 
 
-def build_frame(src: Source, req: Request, width: int, height: int) -> Frame:
+def build_frame(src: Source, req: Request, width: int, height: int,
+                progress: Callable[[float], None] | None = None,
+                cancelled: Callable[[], bool] | None = None) -> Frame | None:
+    """Draw ``req``. A reduction that isn't cached is read first, reporting ``progress``
+    (0 to 1); returns None if ``cancelled`` stops it."""
     if width < MIN_WIDTH or height < MIN_HEIGHT:
         return Frame(req, text_block("make the window bigger", width, height), width, height)
     try:
+        data = request_data(src, req, progress, cancelled)
         if req.kind == "map":
-            return _map_frame(src, req, width, height)
+            return _map_frame(src, req, data, width, height)
         if req.kind == "line":
-            return _line_frame(src, req, width, height)
-        return _scalar_frame(src, req, width, height)
+            return _line_frame(src, req, data, width, height)
+        return _scalar_frame(src, req, data, width, height)
+    except Cancelled:
+        return None
     except Exception as exc:  # noqa: BLE001 - show any read/draw problem in the pane
         msg = f"can't draw {req.var}: {exc}"
         return Frame(req, text_block(msg, width, height), width, height, error=msg)
 
 
-def _header(src: Source, req: Request, free: list[str], view: str) -> str:
+def _header(src: Source, req: Request, others: list[str], view: str) -> str:
+    """The view, then each of ``others``: its position, or the statistic it is reduced with."""
     idx = req.index_dict()
+    reduced = req.reduce_dict()
     parts = [view]
-    for d in free:
-        dim = src.dims[d]
-        parts.append(f"{short_name(d)} {dim.label(int(idx[d]))}")
+    for d in others:
+        where = reduced[d] if d in reduced else src.dims[d].label(int(idx[d]))
+        parts.append(f"{short_name(d)} {where}")
     return " · ".join(parts)
 
 
-def _map_frame(src: Source, req: Request, width: int, height: int) -> Frame:
+def _weighting(src: Source, req: Request) -> str:
+    """For the status line: how a mean over dimensions was weighted."""
+    note = src.reduce_weighting(req.var, req.reduce)
+    return f" · {note}" if note else ""
+
+
+def _map_frame(src: Source, req: Request, data: np.ndarray, width: int, height: int) -> Frame:
     v = src.vars[req.var]
     idx = req.index_dict()
     xd, yd = src.dims[req.xdim], src.dims[req.ydim]
-    data = src.read(req.var, idx)
-    kept = [d for d in v.dims if not isinstance(idx[d], int)]
+    kept = [d for d in v.dims if isinstance(idx.get(d), tuple)]
     if kept.index(req.xdim) < kept.index(req.ydim):
         data = data.T  # → [y, x]
     xa, xb = idx[req.xdim]
@@ -295,6 +327,7 @@ def _map_frame(src: Source, req: Request, width: int, height: int) -> Frame:
         probe_value = float(data[pyp - ya, pxp - xa])
         status += (f" · probe {short_name(req.xdim)}={xd.label(pxp)} {short_name(req.ydim)}={yd.label(pyp)}"
                    f" → {_value_text(probe_value, v.units)}")
+    status += _weighting(src, req)  # last: on a narrow pane it is cut off before the probe readout is
     return Frame(
         request=req,
         lines=fig.lines,
@@ -327,12 +360,12 @@ def _view_name(src: Source, req: Request) -> str:
     return "value"
 
 
-def _line_frame(src: Source, req: Request, width: int, height: int) -> Frame:
+def _line_frame(src: Source, req: Request, data: np.ndarray, width: int, height: int) -> Frame:
     v = src.vars[req.var]
     idx = req.index_dict()
     d = src.dims[req.xdim]
     a, b = idx[req.xdim]
-    values = np.asarray(src.read(req.var, idx), dtype=float).reshape(-1)
+    values = np.asarray(data, dtype=float).reshape(-1)
     coord = d.values[a:b]
     lo, hi, mean, nnan = _stats(values)
     colour = req.colour
@@ -350,11 +383,10 @@ def _line_frame(src: Source, req: Request, width: int, height: int) -> Frame:
         warnings.simplefilter("ignore", RuntimeWarning)
         fig = line_figure(coord, values, width, height, axis_spec(d, coord), title,
                           vertical=vertical, coord_up=coord_up, marker=marker, value_range=value_range)
-    free = [x for x in v.dims if x != req.xdim]
-    where = ", ".join(f"{short_name(x)}={src.dims[x].label(int(idx[x]), with_lead=False)}"
-                      for x in free if src.dims[x].role in ("x", "y"))
+    here = [x for x in v.dims if x in idx and x != req.xdim and src.dims[x].role in ("x", "y")]
+    where = ", ".join(f"{short_name(x)}={src.dims[x].label(int(idx[x]), with_lead=False)}" for x in here)
     view = _view_name(src, req) + (f" at {where}" if where else "")
-    others = [x for x in free if src.dims[x].role not in ("x", "y")]
+    others = [x for x in v.dims if x != req.xdim and x not in here]
     header = _header(src, req, others, view)
     stats = f"min {format_number(lo)}  max {format_number(hi)}  mean {format_number(mean)}"
     if nnan:
@@ -369,6 +401,7 @@ def _line_frame(src: Source, req: Request, width: int, height: int) -> Frame:
     if marker is not None:
         probe_value = float(values[marker])
         status += f" · {short_name(req.xdim)}={d.label(marker_i)} → {_value_text(probe_value, v.units)}"
+    status += _weighting(src, req)
     maps = {req.xdim: AxisMap(a, n, max(1, dots), reverse=False)}
     return Frame(
         request=req,
@@ -388,9 +421,9 @@ def _line_frame(src: Source, req: Request, width: int, height: int) -> Frame:
     )
 
 
-def _scalar_frame(src: Source, req: Request, width: int, height: int) -> Frame:
+def _scalar_frame(src: Source, req: Request, data: np.ndarray, width: int, height: int) -> Frame:
     v = src.vars[req.var]
-    value = float(np.asarray(src.read(req.var, {})).reshape(-1)[0])
+    value = float(np.asarray(data).reshape(-1)[0])
     text = f"{v.name} = {_value_text(value, v.units)}"
-    return Frame(req, text_block(text, width, height), width, height, header="value",
-                 stats=v.long_name, probe_value=value)
+    return Frame(req, text_block(text, width, height), width, height, header=_header(src, req, list(v.dims), "value"),
+                 stats=v.long_name, status=_weighting(src, req).removeprefix(" · "), probe_value=value)

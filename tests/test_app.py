@@ -593,3 +593,296 @@ async def test_manual_range_boxes_appear_for_manual_and_apply_on_tab(app):
         await settle(pilot, app)
         assert app.viewer.colour.mode == "manual"
         assert app.last_frame.vrange[0] == -5.0
+
+
+# --------------------------------------------------------------------------- reducing over dimensions
+
+
+def _options(app):
+    return {o.id: str(o.prompt) for o in app.screen.query_one("OptionList")._options}
+
+
+def _pane(app):
+    return str(app.query_one("DimensionPanel").render()).splitlines()
+
+
+async def test_average_over_time_from_the_dimension_menu_and_restore(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("right_square_bracket")  # time 0 → 1
+        await pilot.press("tab")  # Variables → Dimensions, cursor on time
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _options(app)["reduce:time"] == "Average over time…"
+        app.screen.dismiss("reduce:time")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionMenu)  # the statistics to choose from
+        assert list(_options(app)) == ["stat:mean:time", "stat:min:time", "stat:max:time", "stat:sum:time"]
+        await pilot.press("enter")  # the first: mean
+        await settle(pilot, app)
+        assert app.viewer.reductions() == (("time", "mean"),)
+        frame = app.last_frame
+        assert frame.request.reduce == (("time", "mean"),)
+        assert frame.header == "map y–x · time mean · full_levels 0"
+        assert frame.probe_value == 1500 + 20 + 3  # the mean of time steps 0…3 at y=2, x=3
+        lines = _pane(app)
+        assert lines[0].split() == ["time", "mean"] and "/" not in lines[0]
+        # it can't be stepped any more: ←→ on it do nothing, and [ ] step the level instead
+        await pilot.press("right", "right_square_bracket")
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 1 and app.last_frame.request.reduce == (("time", "mean"),)
+        # the same menu restores it, where it was
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _options(app) == {"restore:time": "Restore time", "reduce:time": "Statistic… (mean)"}
+        await pilot.press("enter")
+        await settle(pilot, app)
+        assert app.viewer.reductions() == () and app.viewer.pos("time") == 1
+        assert app.last_frame.header == "map y–x · time 2000-01-01 00:30 (T+1 h 00 min) · full_levels 1"
+        assert "2/4" in _pane(app)[0]
+
+
+async def test_zonal_mean_from_the_plot_menu_then_a_profile_of_it(latlon):
+    app = NctuiApp(Source(latlon), "air_temperature")
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.query_one(PlotView).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert _options(app)["reduce:longitude"] == "Average over longitude…"
+        app.screen.dismiss("reduce:longitude")
+        await pilot.pause()
+        app.screen.dismiss("stat:mean:longitude")
+        await settle(pilot, app)
+        assert (app.viewer.kind, app.viewer.xdim, app.viewer.ydim) == ("map", "latitude", "level_height")
+        assert app.last_frame.header == "section level_height–latitude · time 2000-01-01 · longitude mean"
+        assert "unweighted mean" in app.last_frame.status
+        await pilot.press("enter")
+        await pilot.pause()
+        options = _options(app)
+        assert "line:longitude" not in options  # no line along a collapsed dimension
+        assert options["restore:longitude"] == "Restore longitude (mean)"
+        assert options["reduce:latitude"] == "Average over latitude…"
+        app.screen.dismiss("line:level_height")
+        await settle(pilot, app)
+        assert app.last_frame.header.startswith("profile along level_height at latitude=0 · ")
+        assert app.last_frame.request.reduce == (("longitude", "mean"),)
+        # the latitude menu says its mean is weighted
+        app._menu_choice("reduce:latitude")
+        await pilot.pause()
+        assert _options(app)["stat:mean:latitude"] == "Mean (cos(lat) weights)"
+        app.screen.dismiss("stat:mean:latitude")
+        await settle(pilot, app)
+        assert "cos(lat)-weighted mean" in app.last_frame.status
+
+
+async def test_reduced_dimension_cant_go_on_an_axis_or_be_animated(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "max")
+        await settle(pilot, app)
+        await pilot.press("tab")
+        await pilot.press("x")  # time on the x axis: no
+        await settle(pilot, app)
+        assert app.viewer.xdim == "projection_x_coordinate"
+        app._start_animation("time")
+        assert app._anim_timer is None and "time is reduced" in app._play_error
+        await pilot.press("space")  # plays the level instead
+        await pilot.pause()
+        assert app._anim_timer is not None and app._anim_dim == "full_levels"
+        assert await wait_for(pilot, lambda: app.viewer.pos("full_levels") > 0)
+        await pilot.press("space")
+        await settle(pilot, app)
+        assert app.last_frame.request.reduce == (("time", "max"),)
+
+
+async def test_reductions_stay_when_the_variable_changes(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        app.set_reduction("full_levels", "max")
+        await settle(pilot, app)
+        app.select_var("rho")
+        await settle(pilot, app)
+        assert app.last_frame.request.var == "rho"
+        assert app.last_frame.request.reduce == (("time", "mean"), ("half_levels", "max"))
+        assert _pane(app)[2].split() == ["half_levels", "max"]
+
+
+async def test_a_long_reduction_shows_progress_and_esc_cancels_it(app, monkeypatch):
+    import threading
+
+    from nctui import data
+
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        before = app.last_frame.request
+        monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 1)  # a block per time step
+        monkeypatch.setattr(app, "REDUCE_QUIET", 0.0)
+        gate, reads = threading.Event(), []
+        read = app.src._slice
+
+        def slow(*args):
+            reads.append(1)
+            if len(reads) > 1:
+                gate.wait(10)  # the second block hangs until the test lets go
+            return read(*args)
+
+        monkeypatch.setattr(app.src, "_slice", slow)
+        app.viewer.set_pos("full_levels", 3)  # a level that hasn't been read
+        app.set_reduction("time", "mean")
+        assert await wait_for(pilot, lambda: "mean over time" in str(app.query_one("#topbar-left").render()))
+        assert "esc cancels" in str(app.query_one("#topbar-left").render())
+        assert app.last_frame.request == before  # the old plot stays up meanwhile
+        await pilot.press("escape")
+        gate.set()
+        await settle(pilot, app)
+        assert await wait_for(pilot, lambda: not app._building)
+        assert app.viewer.reductions() == () and app.viewer.pos("full_levels") == 0  # back to what was drawn
+        assert app.last_frame.request.reduce == ()
+        assert "mean over time" not in str(app.query_one("#topbar-left").render())
+        assert not app.src.reduce_cached("theta", {"full_levels": 3}, (("time", "mean"),))
+
+
+async def test_restoring_while_reducing_stops_the_reduction(app, monkeypatch):
+    import threading
+
+    from nctui import data
+
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 1)
+        gate, reads = threading.Event(), []
+        read = app.src._slice
+
+        def slow(*args):
+            reads.append(1)
+            if len(reads) > 1:
+                gate.wait(10)
+            return read(*args)
+
+        monkeypatch.setattr(app.src, "_slice", slow)
+        app.viewer.set_pos("full_levels", 3)
+        app.set_reduction("time", "mean")
+        assert await wait_for(pilot, lambda: len(reads) > 1)
+        app.set_reduction("time", None)
+        gate.set()
+        await settle(pilot, app)
+        assert await wait_for(pilot, lambda: app.last_frame.request.index_dict().get("full_levels") == 3)
+        assert app.last_frame.request.reduce == () and len(reads) <= 4  # the mean was dropped part way
+        assert not app.src.reduce_cached("theta", {"full_levels": 3}, (("time", "mean"),))
+
+
+async def test_fit_animation_range_of_a_reduced_view(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        app.viewer.colour.mode = "anim"
+        app.view_changed()
+        assert await wait_for(pilot, lambda: app.viewer.anim_ranges)
+        await settle(pilot, app)
+        # theta = 1000 t + 100 z + 10 y + x: the time mean over every level spans 1500 … 1500 + 546
+        assert app.viewer.request().anim_range == (1500.0, 2046.0)
+        assert app.last_frame.vrange == (1500.0, 2046.0)
+        assert "range of all full_levels steps" in app.last_frame.stats
+
+
+async def test_goto_and_settings_leave_out_a_reduced_dimension(app):
+    from textual.widgets import Select
+
+    from nctui.screens.goto import GoToScreen
+
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        await settle(pilot, app)
+        await pilot.press("g")
+        await pilot.pause()
+        assert isinstance(app.screen, GoToScreen)
+        assert not app.screen.query("#dim-0") and app.screen.query("#dim-1")
+        app.screen.query_one("#dim-1").value = "#4"
+        app.screen.query_one("#dim-1").focus()
+        await pilot.press("enter")
+        await settle(pilot, app)
+        assert app.viewer.pos("full_levels") == 4 and app.viewer.reductions() == (("time", "mean"),)
+        await pilot.press("p")
+        await pilot.pause()
+        choices = [value for _, value in app.screen.query_one("#xdim", Select)._options]
+        assert "time" not in choices and "full_levels" in choices
+
+
+async def test_save_a_reduced_plot(app, tmp_path):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        await settle(pilot, app)
+        await pilot.press("e")
+        await pilot.pause()
+        assert app.screen.query_one("#file").value == "./theta_timemean_full_levels0.png"
+        assert "time mean" in app.screen.query_one("#title").value
+        out = tmp_path / "mean.png"
+        app.screen.query_one("#file").value = str(out)
+        await pilot.press("enter")
+        assert await wait_for(pilot, out.exists)
+
+
+async def test_every_dimension_reduced_shows_one_number_and_can_be_restored(app):
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        for d in app.viewer.v.dims:
+            app.set_reduction(d, "min")
+        await settle(pilot, app)
+        assert app.last_frame.error is None and app.last_frame.probe_value == 0.0
+        assert app.last_frame.header == "value · time min · full_levels min · y min · x min"
+        app.query_one(PlotView).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        options = _options(app)
+        assert options["restore:time"] == "Restore time (min)" and not any(k.startswith("line:") for k in options)
+        app.screen.dismiss("restore:time")
+        await settle(pilot, app)
+        assert app.last_frame.header == "time series along time · full_levels min · y min · x min"
+        await pilot.press("g", "escape", "p", "escape")  # the popups cope with one dimension left
+        await settle(pilot, app)
+        assert app.last_frame.error is None
+
+
+async def test_cancelling_an_animation_save_stops_its_colour_range_scan(app, tmp_path, monkeypatch):
+    """The fit-animation range of a reduced view is a long read: cancel must reach it."""
+    import threading
+
+    from nctui import data
+
+    class Dialog:
+        said: list = []
+
+        def progress(self, text):
+            self.said.append(text)
+
+        def finished(self, ok, text):
+            self.said.append((ok, text))
+
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        await settle(pilot, app)
+        monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 5 * 7)  # one time step per block
+        gate, reads = threading.Event(), []
+        read = app.src._slice
+
+        def slow(*args):
+            reads.append(1)
+            gate.wait(10)
+            return read(*args)
+
+        monkeypatch.setattr(app.src, "_slice", slow)
+        app.viewer.colour.mode = "anim"  # not scanned yet: the save has to scan
+        out = tmp_path / "a.gif"
+        dialog = Dialog()
+        app.save_animation(str(out), "", (3, 2), 40, 4, [0, 1, 2], dialog)
+        assert await wait_for(pilot, lambda: reads)
+        app.cancel_save()
+        gate.set()
+        assert await wait_for(pilot, lambda: not app._save_worker.is_running)
+        assert len(reads) <= 2  # not the 20-odd blocks of every level
+        assert not out.exists() and dialog.said == ["scanning all full_levels steps…"]

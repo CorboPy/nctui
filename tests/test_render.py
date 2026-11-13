@@ -198,3 +198,115 @@ def test_line_along_a_mirrored_latitude_reads_true_latitudes(latlon):
     labels = [float(t) for t in "".join(s.text for s in f.lines[-2]).split()]
     assert 90 in labels and max(labels) == 90
     assert labels.index(90) not in (0, len(labels) - 1)
+
+
+# --------------------------------------------------------------------------- reduced views
+
+
+def _field(path, name):
+    import netCDF4
+
+    with netCDF4.Dataset(path) as ds:
+        return np.ma.filled(ds.variables[name][:].astype(np.float64), np.nan)
+
+
+def test_time_mean_map_frame(cartesian):
+    src = Source(cartesian)
+    theta = _field(cartesian, "theta")
+    v = Viewer(src)
+    v.select_var("theta")
+    v.set_pos("full_levels", 2)
+    v.set_reduction("time", "mean")
+    f = build_frame(src, v.request(), 80, 30)
+    assert f.error is None
+    assert f.header == "map y–x · time mean · full_levels 2"
+    mean = theta[:, 2].mean(axis=0)
+    assert f.vrange == (mean.min(), mean.max())
+    assert f.probe_value == mean[2, 3]  # the probe reads the mean, at every data point
+    assert f.status.endswith("→ 1723 K · unweighted mean")  # after the probe readout, which matters more
+
+
+def test_zonal_mean_section_and_its_profile(latlon):
+    src = Source(latlon)
+    ta = _field(latlon, "air_temperature")
+    v = Viewer(src)
+    v.select_var("air_temperature")
+    v.set_pos("time", 1)
+    v.set_reduction("longitude", "mean")
+    f = build_frame(src, v.request(), 100, 30)
+    assert f.header == "section level_height–latitude · time 2000-01-11 · longitude mean"
+    assert "unweighted mean" in f.status  # every longitude counts the same
+    zonal = np.nanmean(ta[1], axis=2)
+    np.testing.assert_allclose(f.probe_value, zonal[v.pos("level_height"), v.pos("latitude")])
+    v.open_line("level_height")  # the profile through the probe is of the zonal mean too
+    f = build_frame(src, v.request(), 100, 30)
+    assert f.header == "profile along level_height at latitude=0 · time 2000-01-11 · longitude mean"
+    np.testing.assert_allclose(f.vrange, (zonal[:, 4].min(), zonal[:, 4].max()))
+
+
+def test_domain_mean_time_series_says_it_is_weighted(latlon):
+    src = Source(latlon)
+    ta = _field(latlon, "air_temperature")
+    v = Viewer(src)
+    v.select_var("air_temperature")
+    v.set_pos("level_height", 0)
+    v.set_reduction("latitude", "mean")
+    v.set_reduction("longitude", "mean")
+    v.set_axes("time", None)
+    f = build_frame(src, v.request(), 100, 30)
+    assert f.header == "time series along time · level_height 0 · latitude mean · longitude mean"
+    assert "cos(lat)-weighted mean" in f.status
+    w = np.cos(np.deg2rad(np.linspace(-80, 80, 9)))[None, :, None] * np.isfinite(ta[:, 0])
+    series = np.nansum(ta[:, 0] * w, axis=(1, 2)) / w.sum(axis=(1, 2))
+    np.testing.assert_allclose(f.vrange, (series.min(), series.max()))
+    np.testing.assert_allclose(f.probe_value, series[0])
+
+
+def test_everything_reduced_is_one_number(cartesian):
+    src = Source(cartesian)
+    v = Viewer(src)
+    v.select_var("theta")
+    for d in src.vars["theta"].dims:
+        v.set_reduction(d, "max")
+    f = build_frame(src, v.request(), 80, 20)
+    assert f.error is None and f.probe_value == 3546.0
+    assert f.header == "value · time max · full_levels max · y max · x max"
+    assert "theta = 3546 K" in "".join(s.text for line in f.lines for s in line)
+
+
+def test_reduced_frame_with_zoom_centring_and_mirroring(latlon):
+    src = Source(latlon)
+    ta = _field(latlon, "air_temperature")
+    mean = np.nanmean(ta[:, 0], axis=0)
+    v = Viewer(src)
+    v.select_var("air_temperature")
+    v.set_reduction("time", "mean")
+    build_frame(src, v.request(), 100, 40)
+    v.set_pos("longitude", 1)
+    v.set_pos("latitude", 6)
+    v.centre_here(latitude=True)  # longitude rolled, latitude mirrored about the probe
+    v.zoom(2)
+    f = build_frame(src, v.request(), 100, 40)
+    assert f.error is None and f.maps["latitude"].n < 18
+    np.testing.assert_allclose(f.probe_value, mean[6, 1])  # still the same grid point's mean
+    for _ in range(3):  # on over the pole: the mirrored rows read the same means
+        row = src.stored_index("latitude", v.pos("latitude") + 1)
+        v.step("latitude", 1)
+        f = build_frame(src, v.request(), 100, 40)
+        np.testing.assert_allclose(f.probe_value, mean[row, 1])
+    assert row == 8  # 6 → 7 → 8 → 8: back down the other side
+
+
+def test_build_frame_reports_progress_and_can_be_cancelled(cartesian, monkeypatch):
+    from nctui import data
+
+    monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 5 * 7)  # one time step of the map per block
+    src = Source(cartesian)
+    v = Viewer(src)
+    v.select_var("theta")
+    v.set_reduction("time", "mean")
+    seen = []
+    assert build_frame(src, v.request(), 80, 30, cancelled=lambda: len(seen) >= 2, progress=seen.append) is None
+    assert seen == [0.25, 0.5]
+    assert build_frame(src, v.request(), 80, 30, progress=seen.append).error is None
+    assert seen[-1] == 1.0

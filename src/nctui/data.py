@@ -8,6 +8,8 @@ read from disk.
 
 from __future__ import annotations
 
+import itertools
+import math
 import os
 import re
 import threading
@@ -23,6 +25,11 @@ TIME, Z, Y, X, OTHER = "time", "z", "y", "x", "other"
 
 # An index into one dimension is either a single position or a [start, stop) window.
 Index = int | tuple[int, int]
+
+# Dimensions collapsed by a statistic: (dimension, statistic) pairs.
+STATS = ("mean", "min", "max", "sum")
+Reduce = tuple[tuple[str, str], ...]
+REDUCE_BLOCK_BYTES = 32 * 1024 * 1024  # most data read at once while reducing
 
 
 class SourceError(Exception):
@@ -451,6 +458,8 @@ class Source:
         self._centres: dict[str, float] = {}
         self._stored_values: dict[str, np.ndarray] = {}
         self._cache = _LRU(cache_mb * 1024 * 1024)
+        # reduced fields are kept apart, so the slices read to make the next one don't push them out
+        self._reduced = _LRU(cache_mb * 1024 * 1024)
 
         datasets = [self._open(p) for p in self.paths]
         self.global_attrs = _attrs(datasets[0])
@@ -681,19 +690,20 @@ class Source:
 
     # ------------------------------------------------------------------ reading
 
-    def read(self, var: str, index: Mapping[str, Index]) -> np.ndarray:
+    def read(self, var: str, index: Mapping[str, Index], stored: bool = False) -> np.ndarray:
         """Read part of ``var``.
 
         ``index`` maps dimension names to an int (that dimension is dropped from
         the result) or a ``(start, stop)`` window. Dimensions not mentioned are
         read whole. The result is float64 with NaN where data is missing, and its
-        axes keep the variable's dimension order.
+        axes keep the variable's dimension order. With ``stored``, ``index`` counts
+        along the file's axes, whatever is centred.
         """
         v = self.vars[var]
         norm: dict[str, Index] = {}
         for d in v.dims:
             ix = index.get(d)
-            size = self.dims[d].size
+            size = self.file_size(d) if stored else self.dims[d].size
             if ix is None:
                 norm[d] = (0, size)
             elif isinstance(ix, tuple):
@@ -701,8 +711,8 @@ class Source:
                 norm[d] = (a, max(a, b))
             else:
                 norm[d] = int(np.clip(int(ix), 0, size - 1))
-        rolls = {d: self._roll.get(d, 0) for d in v.dims}
-        mirrored = [d for d in v.dims if d in self._mirror]
+        rolls = {d: 0 if stored else self._roll.get(d, 0) for d in v.dims}
+        mirrored = [] if stored else [d for d in v.dims if d in self._mirror]
         key = (var, tuple(norm[d] for d in v.dims), tuple(rolls.values()), tuple(self._centres[d] for d in mirrored))
         cached = self._cache.get(key)
         if cached is not None:
@@ -896,6 +906,173 @@ class Source:
                 self._datasets[file_index].variables[v.name].getValue()
         return _values(raw)
 
+    # ------------------------------------------------------------------ reducing
+
+    def reduce_read(
+        self,
+        var: str,
+        index: Mapping[str, Index],
+        reduce: Reduce,
+        progress: Callable[[float], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> np.ndarray | None:
+        """Read part of ``var`` with the dimensions in ``reduce`` collapsed by a statistic.
+
+        ``reduce`` pairs dimensions with ``mean``, ``min``, ``max`` or ``sum``; ``index``
+        is as in :meth:`read` for the others. Missing values are ignored, and where
+        every value is missing so is the result. A reduced dimension is collapsed over
+        its whole length in the file, each point once, however it is centred or zoomed.
+        Dimensions that share a statistic collapse together: a mean over latitude and
+        longitude is one mean of every valid point, weighted by cos(latitude) when a
+        latitude in degrees is collapsed. Different statistics apply from the variable's
+        last dimension to its first (space before time).
+
+        The data is read a block at a time (see :data:`REDUCE_BLOCK_BYTES`) through the
+        slice cache, tiling the dimensions kept as well as those collapsed last; only
+        dimensions collapsed first, under a different statistic, are read whole. The
+        result is kept for the whole of the windowed dimensions, so zooming, scrolling
+        and centring afterwards don't read again. Returns None if cancelled.
+        """
+        if not reduce:
+            return self.read(var, index)
+        v = self.vars[var]
+        key, stats, fixed, shown = self._reduce_plan(v, index, reduce)
+        full = self._reduced.get(key)
+        if full is None:
+            full = self._reduce(v, stats, fixed, progress, cancelled)
+            if full is None:
+                return None
+            full = np.asarray(full, dtype=np.float64)
+            full.flags.writeable = False
+            self._reduced.put(key, full)
+        out = full
+        for axis, (d, (a, b)) in enumerate(shown.items()):
+            out = out[(slice(None),) * axis + (self._file_rows(d, a, b),)]
+        out.flags.writeable = False
+        return out
+
+    def reduce_cached(self, var: str, index: Mapping[str, Index], reduce: Reduce) -> bool:
+        """Would :meth:`reduce_read` return at once?"""
+        return not reduce or self._reduced.get(self.reduce_key(var, index, reduce)) is not None
+
+    def reduce_key(self, var: str, index: Mapping[str, Index], reduce: Reduce) -> tuple:
+        """What a reduced field depends on: not the windows, nor how anything is centred."""
+        return self._reduce_plan(self.vars[var], index, reduce)[0]
+
+    def reduce_weighting(self, var: str, reduce: Reduce) -> str:
+        """How the means in ``reduce`` are weighted, to tell the user ("" if there are none)."""
+        notes = ["cos(lat)-weighted mean" if any(self.dims[d].is_lat for d in dims) else "unweighted mean"
+                 for stat, dims in self._reduce_groups(self.vars[var], dict(reduce)) if stat == "mean"]
+        return ", ".join(dict.fromkeys(notes))
+
+    def _reduce_plan(self, v: Var, index: Mapping[str, Index], reduce: Reduce):
+        """Cache key, statistic per reduced dimension, file position of each dimension
+        held at one point, and the window shown of each of the rest."""
+        stats = dict(reduce)
+        for d, stat in stats.items():
+            if d not in v.dims:
+                raise ValueError(f"{v.name} has no dimension {d}")
+            if stat not in STATS:
+                raise ValueError(f"unknown statistic {stat!r}: choose from {', '.join(STATS)}")
+        fixed: dict[str, int] = {}
+        shown: dict[str, tuple[int, int]] = {}
+        for d in v.dims:
+            if d in stats:
+                continue
+            ix = index.get(d)
+            size = self.dims[d].size
+            if ix is None:
+                shown[d] = (0, size)
+            elif isinstance(ix, tuple):
+                a, b = max(0, int(ix[0])), min(size, int(ix[1]))
+                shown[d] = (a, max(a, b))
+            else:
+                fixed[d] = self.stored_index(d, int(np.clip(int(ix), 0, size - 1)))
+        key = (v.name, tuple((d, stats[d]) for d in v.dims if d in stats),
+               tuple(fixed.get(d) for d in v.dims if d not in stats))
+        return key, stats, fixed, shown
+
+    @staticmethod
+    def _reduce_groups(v: Var, stats: Mapping[str, str]) -> list[tuple[str, list[str]]]:
+        """The order to collapse in: last dimension first, neighbours with one statistic together."""
+        groups: list[tuple[str, list[str]]] = []
+        for d in reversed(v.dims):
+            if d not in stats:
+                continue
+            if groups and groups[-1][0] == stats[d]:
+                groups[-1][1].insert(0, d)
+            else:
+                groups.append((stats[d], [d]))
+        return groups
+
+    def _file_rows(self, dim: str, a: int, b: int) -> slice | np.ndarray:
+        """The file's indices shown at display indices ``a`` to ``b`` of ``dim``."""
+        rows = self._mirror.get(dim)
+        if rows is not None:
+            return rows[a:b]
+        shift = self._roll.get(dim, 0)
+        return (np.arange(a, b) + shift) % self.dims[dim].size if shift else slice(a, b)
+
+    def _reduce(self, v: Var, stats: Mapping[str, str], fixed: Mapping[str, int], progress, cancelled):
+        """Collapse the dimensions in ``stats``, over the whole of the file's axes."""
+        groups = self._reduce_groups(v, stats)
+        last_stat, last = groups[-1]  # the group with the outermost dimension: summed up block by block
+        axes = [d for d in v.dims if d not in fixed]
+        whole = {d: (0, self.file_size(d)) for d in axes}
+        nbytes = 8.0 * math.prod(self.file_size(d) for d in axes)  # Python ints: no overflow
+        # tile the dimensions kept in the result and those of the last group, outermost first,
+        # until a block is small enough (an earlier group has to be read whole to be collapsed)
+        kept = [d for d in axes if d not in stats]
+        tiled = [d for d in axes if d in kept or d in last]
+        spans = {d: [whole[d]] for d in tiled}
+        for d in tiled:
+            n = self.file_size(d)
+            if nbytes <= REDUCE_BLOCK_BYTES or n == 0:
+                break
+            step = max(1, int(REDUCE_BLOCK_BYTES // (nbytes / n)))
+            spans[d] = [(a, min(n, a + step)) for a in range(0, n, step)]
+            nbytes = nbytes / n * step
+        blocks = list(itertools.product(*(spans[d] for d in tiled)))
+        shape = [self.file_size(d) for d in kept]
+        extreme = last_stat in ("min", "max")
+        acc = (np.full(shape, np.nan), None) if extreme else (np.zeros(shape), np.zeros(shape))
+
+        def weights(dims: list[str], stat: str, names: list[str], norm: Mapping[str, Index]) -> np.ndarray | None:
+            lat = next((d for d in dims if self.dims[d].is_lat), None) if stat == "mean" else None
+            if lat is None:
+                return None
+            ix = norm[lat]
+            a, b = (ix, ix + 1) if isinstance(ix, int) else ix
+            w = np.clip(np.cos(np.deg2rad(self._stored_values.get(lat, self.dims[lat].values)[a:b])), 0.0, None)
+            return w.reshape([-1 if n == lat else 1 for n in names])
+
+        for k, block in enumerate(blocks):
+            if cancelled is not None and cancelled():
+                return None
+            norm: dict[str, Index] = {**fixed, **whole}
+            for d, (a, b) in zip(tiled, block, strict=True):
+                # one step of a reduced dimension: the slice a map of it reads too
+                norm[d] = a if b - a == 1 and d in last else (a, b)
+            data = self.read(v.name, norm, stored=True)
+            for i, d in enumerate(axes):
+                if isinstance(norm[d], int):
+                    data = np.expand_dims(data, i)  # keep its axis, to collapse below
+            names = list(axes)
+            for stat, dims in groups[:-1]:
+                part = _partial(data, tuple(names.index(d) for d in dims), stat, weights(dims, stat, names, norm))
+                data = _finish(part, stat)
+                names = [n for n in names if n not in dims]
+            part = _partial(data, tuple(names.index(d) for d in last), last_stat,
+                            weights(last, last_stat, names, norm))
+            here = tuple(slice(*norm[d]) for d in kept)  # this block's part of the result
+            merged = _merge((acc[0][here], None if extreme else acc[1][here]), part, last_stat)
+            acc[0][here] = merged[0]
+            if not extreme:
+                acc[1][here] = merged[1]
+            if progress is not None:
+                progress((k + 1) / len(blocks))
+        return _finish(acc, last_stat)
+
     def value_range(
         self,
         var: str,
@@ -903,17 +1080,24 @@ class Source:
         sweep: str | None = None,
         progress: Callable[[float], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
+        reduce: Reduce = (),
     ) -> tuple[float, float] | None:
         """Minimum and maximum of ``var`` over every position along ``sweep``.
 
         The other dimensions are indexed by ``index`` (a position, or a window as
-        in :meth:`read`). With no ``sweep``, the whole variable. Reads one slice at
-        a time; returns None if cancelled or there is no finite data.
+        in :meth:`read`), or collapsed as ``reduce`` says. With no ``sweep``, the
+        whole variable (or, with ``reduce``, the reduced field ``index`` selects).
+        Reads one slice at a time; returns None if cancelled or there is no finite data.
         """
         v = self.vars[var]
         if v.ndim == 0:
             val = float(np.asarray(self.read(var, {})).reshape(-1)[0])
             return (val, val)
+        if sweep is None and reduce:  # nothing to step through: the range of the reduced field itself
+            field = self.reduce_read(var, index or {}, reduce, progress, cancelled)
+            if field is None or not np.isfinite(field).any():
+                return None
+            return float(np.nanmin(field)), float(np.nanmax(field))
         whole = sweep is None
         if whole:
             sweep = v.dims[0]
@@ -925,6 +1109,11 @@ class Source:
             if whole:
                 # straight from disk: a whole-variable scan would flush the slice cache
                 block = self._read_uncached(v, {d: (i if d == sweep else (0, self.file_size(d))) for d in v.dims})
+            elif reduce:
+                part = None if progress is None else (lambda f, i=i: progress((i + f) / n))
+                block = self.reduce_read(var, {**(index or {}), sweep: i}, reduce, part, cancelled)
+                if block is None:
+                    return None
             else:
                 block = self.read(var, {**(index or {}), sweep: i})  # cached: an animation reads these next
             with warnings.catch_warnings():
@@ -941,6 +1130,36 @@ class Source:
     def close(self) -> None:
         for ds in self._datasets:
             ds.close()
+
+
+def _partial(a: np.ndarray, axes: tuple[int, ...], stat: str, weights: np.ndarray | None = None):
+    """One block's share of a statistic over ``axes``, ignoring NaN.
+
+    The extreme for min and max; for sum and mean the total and the weight of the
+    points that went into it (their number, if there are no ``weights``).
+    """
+    if stat in ("min", "max"):
+        return (np.fmin if stat == "min" else np.fmax).reduce(a, axis=axes, initial=np.nan), None
+    valid = ~np.isnan(a)
+    values = np.where(valid, a, 0.0)
+    if weights is None:
+        return values.sum(axis=axes), valid.sum(axis=axes, dtype=np.float64)
+    return (values * weights).sum(axis=axes), (valid * weights).sum(axis=axes)
+
+
+def _merge(acc, part, stat: str):
+    if stat in ("min", "max"):
+        return (np.fmin if stat == "min" else np.fmax)(acc[0], part[0]), None
+    return acc[0] + part[0], acc[1] + part[1]
+
+
+def _finish(acc, stat: str) -> np.ndarray:
+    """The statistic from its running totals: NaN where no value went in."""
+    total, weight = acc
+    if stat in ("min", "max"):
+        return np.asarray(total)
+    some = weight > 0
+    return np.where(some, total / np.where(some, weight, 1.0) if stat == "mean" else total, np.nan)
 
 
 def _attrs(obj) -> dict:
