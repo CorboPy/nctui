@@ -765,6 +765,15 @@ class NctuiApp(App):
         from .frame import colour_range
 
         worker = get_current_worker()
+
+        def scan() -> tuple[float, float] | None:
+            """The range over every animation step; stops (and the save with it) if cancelled."""
+            rng = self.src.value_range(req.var, dict(key[2]), dim, cancelled=lambda: worker.is_cancelled,
+                                       reduce=key[3])
+            if worker.is_cancelled:
+                raise export.Cancelled
+            return rng
+
         try:
             c = req.colour
             if c.mode == "auto":
@@ -775,10 +784,10 @@ class NctuiApp(App):
                 rng = req.anim_range
                 if c.mode == "anim" and rng is None and key is not None:
                     self.call_from_thread(screen.progress, f"scanning all {short_name(dim)} steps…")
-                    rng = self.src.value_range(req.var, dict(key[2]), dim, reduce=key[3])
+                    rng = scan()
                 vrange = colour_range(c, np.empty(0), rng)  # adds symmetric / log as on screen
             if req.kind == "line" and c.mode == "anim" and vrange is None and key is not None:
-                vrange = self.src.value_range(req.var, dict(key[2]), dim, reduce=key[3])
+                vrange = scan()
 
             def progress(k: int, n: int) -> None:
                 self.call_from_thread(screen.progress, f"saving frame {k} of {n}…")

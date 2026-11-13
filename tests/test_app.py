@@ -845,3 +845,44 @@ async def test_every_dimension_reduced_shows_one_number_and_can_be_restored(app)
         await pilot.press("g", "escape", "p", "escape")  # the popups cope with one dimension left
         await settle(pilot, app)
         assert app.last_frame.error is None
+
+
+async def test_cancelling_an_animation_save_stops_its_colour_range_scan(app, tmp_path, monkeypatch):
+    """The fit-animation range of a reduced view is a long read: cancel must reach it."""
+    import threading
+
+    from nctui import data
+
+    class Dialog:
+        said: list = []
+
+        def progress(self, text):
+            self.said.append(text)
+
+        def finished(self, ok, text):
+            self.said.append((ok, text))
+
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app.set_reduction("time", "mean")
+        await settle(pilot, app)
+        monkeypatch.setattr(data, "REDUCE_BLOCK_BYTES", 8 * 5 * 7)  # one time step per block
+        gate, reads = threading.Event(), []
+        read = app.src._slice
+
+        def slow(*args):
+            reads.append(1)
+            gate.wait(10)
+            return read(*args)
+
+        monkeypatch.setattr(app.src, "_slice", slow)
+        app.viewer.colour.mode = "anim"  # not scanned yet: the save has to scan
+        out = tmp_path / "a.gif"
+        dialog = Dialog()
+        app.save_animation(str(out), "", (3, 2), 40, 4, [0, 1, 2], dialog)
+        assert await wait_for(pilot, lambda: reads)
+        app.cancel_save()
+        gate.set()
+        assert await wait_for(pilot, lambda: not app._save_worker.is_running)
+        assert len(reads) <= 2  # not the 20-odd blocks of every level
+        assert not out.exists() and dialog.said == ["scanning all full_levels steps…"]
