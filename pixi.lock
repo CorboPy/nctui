@@ -2698,14 +2698,14 @@ packages:
   timestamp: 1749895533014
 - pypi: ./
   name: nctui
-  version: 0.1.0
-  sha256: be7dff535eb531c79a35b39e40081cf603c23863e3eb05ac6c15b09f1864633b
+  version: 0.1.1
+  sha256: f8cd238c675fa771be75b8d33380e1708df1c04afc6f5388ec619b95011cee75
   requires_dist:
-  - textual>=8.2
-  - netcdf4>=1.7
   - cftime>=1.6
-  - numpy>=2.0
   - matplotlib>=3.9
+  - netcdf4>=1.7
+  - numpy>=2.0
+  - textual>=8.2
   requires_python: '>=3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda
