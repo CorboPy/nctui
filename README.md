@@ -94,7 +94,7 @@ The colours popup (`c`) has four ways to set the range:
 ### Centring a periodic axis
 
 Longitude that goes all the way round can be wrapped so another value sits in the
-middle: press `enter` on the plot and choose *Centre here: longitude*, or type a value
+middle: press `enter` on the plot and choose *Centre here*, or type a value
 under *centre on* in Plot settings (`p`). A 0–360° grid centred on 0 reads -180…180,
 so the UK is no longer split across the edges. The x and y of a Cartesian grid are
 taken to be periodic (as bi-periodic model domains are), so they can be centred the
@@ -104,14 +104,14 @@ Latitude can be centred when the grid reaches both poles. It is mirrored at the
 poles, at the same longitudes, and the plot shows every row twice. Centred on 90,
 it runs from the south pole up to the north pole in the middle, then back down to
 the south pole at the top. Centred on -90 it mirrors about the south pole instead:
-the north pole is at both the top and the bottom. *Centre here: longitude + latitude*
+the north pole is at both the top and the bottom. *Centre here… → longitude + latitude*
 in the enter menu centres both on the probe.
 
 ### Averaging over a dimension
 
 Any dimension can be collapsed with a statistic, for a zonal mean, a time mean, a
 vertical mean or a domain-mean time series. Press `enter` on the plot, or on a
-dimension in the Dimensions pane, and choose *Average over <dim>…*, then *Mean*,
+dimension in the Dimensions pane, and choose *Reduce* and the dimension, then *Mean*,
 *Minimum*, *Maximum* or *Sum*.
 
 - The Dimensions pane shows a reduced dimension as `time  mean`. It has no

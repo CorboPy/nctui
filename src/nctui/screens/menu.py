@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from rich.cells import cell_len
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 from textual.widgets.option_list import Option
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One choice: ``id`` is what the menu returns, ``key`` the shortcut shown beside it."""
+
+    id: str
+    label: str
+    key: str = ""
+    enabled: bool = True
+
+
+Section = tuple[str, list[Entry]]
 
 
 class ActionMenu(ModalScreen[str | None]):
@@ -31,7 +48,7 @@ class ActionMenu(ModalScreen[str | None]):
     }
     ActionMenu OptionList, ActionMenu OptionList:focus {
         height: auto;
-        max-height: 24;
+        max-height: 30;
         border: none;
         padding: 0;
         background: $surface;
@@ -43,20 +60,39 @@ class ActionMenu(ModalScreen[str | None]):
     }
     """
 
-    def __init__(self, title: str, options: list[tuple[str, str]]):
+    def __init__(self, title: str, sections: list[Section]):
         super().__init__()
         self.menu_title = title
-        self.options = options
+        self.sections = [(name, entries) for name, entries in sections if entries]
+
+    @property
+    def entries(self) -> dict[str, Entry]:
+        return {e.id: e for _, entries in self.sections for e in entries}
+
+    def _options(self) -> list[Option | None]:
+        width = max((cell_len(e.label) for _, es in self.sections for e in es), default=0)
+        out: list[Option | None] = []
+        for i, (name, entries) in enumerate(self.sections):
+            if i:
+                out.append(None)
+            if name:
+                out.append(Option(Text(name, style="bold dim"), disabled=True))
+            for e in entries:
+                prompt = Text(e.label + " " * (width - cell_len(e.label)))
+                if e.key:
+                    prompt.append("  " + e.key, style="dim")
+                out.append(Option(prompt, id=e.id, disabled=not e.enabled))
+        return out
 
     def compose(self) -> ComposeResult:
         with Vertical() as box:
             box.border_title = self.menu_title
-            yield OptionList(*[Option(label, id=key) for key, label in self.options])
+            yield OptionList(*self._options())
             yield Label("enter chooses · esc closes", classes="hint")
 
     def on_mount(self) -> None:
         ol = self.query_one(OptionList)
-        ol.highlighted = 0
+        ol.highlighted = next((i for i, o in enumerate(ol.options) if not o.disabled), None)
         ol.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:

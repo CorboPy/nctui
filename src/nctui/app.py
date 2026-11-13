@@ -23,7 +23,7 @@ from .frame import Frame, build_frame, short_name
 from .screens.colours import ColoursScreen
 from .screens.goto import GoToScreen
 from .screens.info import HelpScreen, InfoScreen
-from .screens.menu import ActionMenu
+from .screens.menu import ActionMenu, Entry, Section
 from .screens.save import AnimOptions, SaveOptions, SaveScreen
 from .screens.settings import PlotSettingsScreen
 from .state import Viewer
@@ -816,68 +816,78 @@ class NctuiApp(App):
             value = f" · {format_number(self.last_frame.probe_value, 6)} {v.units}".rstrip()
         return f"{v.name} at {where}{value}" if where else v.name
 
+    def _plot_section(self) -> Section:
+        """The same last section in every menu: how the plot looks and saving it."""
+        return ("Plot", [Entry("colours", "Colours…", "c"), Entry("settings", "Plot settings…", "p"),
+                         Entry("save", "Save plot or animation…", "e")])
+
+    def _reduce_section(self) -> Section:
+        """Restore each reduced dimension, or pick another one to reduce."""
+        viewer = self.viewer
+        entries = [Entry(f"restore:{d}", f"Restore {d} ({viewer.reduction(d)})")
+                   for d in viewer.v.dims if viewer.reduction(d) is not None]
+        if any(viewer.reduction(d) is None for d in viewer.v.dims):
+            entries.append(Entry("reduce_pick", "Reduce a dimension…"))
+        return ("Reduce", entries)
+
+    def _line_label(self, d: str) -> str:
+        role = self.viewer.role(d)
+        return f"Vertical profile ({d})" if role == Z else f"Time series ({d})" if role == TIME else f"Line along {d}"
+
     def action_plot_menu(self) -> None:
         viewer = self.viewer
         if viewer.var is None:
             return
-        options: list[tuple[str, str]] = []
+        here: list[Entry] = []
+        view: list[Entry] = []
         if viewer.kind == "map":
             order = sorted(viewer.live_dims(), key=lambda d: {Z: 0, TIME: 1}.get(viewer.role(d), 2))
             for d in order:
-                role = viewer.role(d)
-                if role == Z:
-                    label = f"Vertical profile here ({d})"
-                elif role == TIME:
-                    label = f"Time series here ({d})"
-                else:
-                    label = f"Line along {d} here"
-                options.append((f"line:{d}", label))
-            options += self._reduce_options()
-            options.append(("every", "Show every point around here (1)"))
-            options.append(("zoom", "Zoom in here (+)"))
+                here.append(Entry(f"line:{d}", self._line_label(d)))
+            view += [Entry("zoom", "Zoom in here", "+"), Entry("every", "Every point around here", "1")]
+        elif viewer.kind == "line":
+            view.append(Entry("back", "Back to the map", "esc", enabled=bool(viewer.stack)))
+            view.append(Entry("every", "Every point around here", "1"))
+        view.append(Entry("fit", "Fit the whole field", "0", enabled=viewer.is_zoomed()))
+        if viewer.kind == "map":
             plain = viewer.centring_axes(latitude=False)
-            if plain:
-                options.append(("centre", "Centre here: " + " + ".join(short_name(d) for d in plain)))
             both = viewer.centring_axes(latitude=True)
             if len(both) > len(plain):
-                options.append(("centre_lat", "Centre here: " + " + ".join(short_name(d) for d in both)))
-            if viewer.centred_axes():
-                options.append(("uncentre", "Undo centring"))
-        elif viewer.kind == "line":
-            if viewer.stack:
-                options.append(("back", "Back to the map (esc)"))
-            options += self._reduce_options()
-            options.append(("every", "Show every point around here (1)"))
-        else:
-            options += self._reduce_options()
-        if viewer.is_zoomed():
-            options.append(("fit", "Fit the whole field (0)"))
-        options += [("colours", "Colours… (c)"), ("settings", "Plot settings… (p)"),
-                    ("save", "Save plot or animation… (e)")]
-        self.push_screen(ActionMenu(self._probe_title(), options), self._menu_choice)
+                view.append(Entry("centre_menu", "Centre here…"))
+            elif plain:
+                view.append(Entry("centre", "Centre here: " + " + ".join(short_name(d) for d in plain)))
+            if plain or both or viewer.centred_axes():
+                view.append(Entry("uncentre", "Undo centring", enabled=bool(viewer.centred_axes())))
+        sections = [("Here", here), self._reduce_section(), ("View", view), self._plot_section()]
+        self.push_screen(ActionMenu(self._probe_title(), sections), self._menu_choice)
 
-    def _reduce_options(self) -> list[tuple[str, str]]:
-        """Menu entries to collapse each dimension with a statistic, or restore one that is."""
+    def _centre_menu(self) -> None:
+        """Centre on the probe along the plain axes, or along latitude too."""
         viewer = self.viewer
-        out = []
-        for d in viewer.v.dims:
-            stat = viewer.reduction(d)
-            out.append((f"reduce:{d}", f"Average over {d}…") if stat is None else
-                       (f"restore:{d}", f"Restore {d} ({stat})"))
-        return out
+        entries = [Entry(key, " + ".join(short_name(d) for d in viewer.centring_axes(latitude=lat)))
+                   for key, lat in (("centre", False), ("centre_lat", True))
+                   if viewer.centring_axes(latitude=lat)]
+        self.push_screen(ActionMenu("Centre here", [("", entries)]), self._menu_choice)
+
+    def _reduce_pick_menu(self) -> None:
+        """Choose which dimension to reduce."""
+        viewer = self.viewer
+        entries = [Entry(f"reduce:{d}", d) for d in viewer.v.dims if viewer.reduction(d) is None]
+        self.push_screen(ActionMenu("Reduce", [("", entries)]), self._menu_choice)
 
     def _statistic_menu(self, dim: str) -> None:
         """Choose the statistic ``dim`` is collapsed with."""
         current = self.viewer.reduction(dim)
-        options = []
+        entries = []
         for stat in STATS:
             label = STAT_LABELS[stat]
             if stat == "mean" and self.src.dims[dim].is_lat:
                 label += " (cos(lat) weights)"
-            options.append((f"stat:{stat}:{dim}", label + (" ✓" if stat == current else "")))
+            entries.append(Entry(f"stat:{stat}:{dim}", label + (" ✓" if stat == current else "")))
+        sections: list[Section] = [("", entries)]
         if current is not None:
-            options.append((f"restore:{dim}", "Restore"))
-        self.push_screen(ActionMenu(f"{dim}: reduce to its", options), self._menu_choice)
+            sections.append(("", [Entry(f"restore:{dim}", "Restore")]))
+        self.push_screen(ActionMenu(f"{dim}: reduce to its", sections), self._menu_choice)
 
     def action_variable_menu(self) -> None:
         tree = self.query_one(VariableTree)
@@ -892,9 +902,9 @@ class NctuiApp(App):
             self.push_screen(InfoScreen(self.src, name))
             return
         self.select_var(name)
-        options = [("plot", "Show the plot (tab)"), ("info", "Attributes… (i)"), ("colours", "Colours… (c)"),
-                   ("settings", "Plot settings… (p)"), ("save", "Save plot or animation… (e)")]
-        self.push_screen(ActionMenu(name, options), self._menu_choice)
+        sections = [("Variable", [Entry("plot", "Show the plot", "tab"), Entry("info", "Attributes…", "i")]),
+                    self._plot_section()]
+        self.push_screen(ActionMenu(name, sections), self._menu_choice)
 
     def action_dimension_menu(self) -> None:
         dims = self.query_one(DimensionPanel)
@@ -904,25 +914,24 @@ class NctuiApp(App):
         viewer = self.viewer
         stat = viewer.reduction(d)
         if stat is not None:  # no position, axis or animation: only the way back
-            options = [(f"restore:{d}", f"Restore {d}"), (f"reduce:{d}", f"Statistic… ({stat})")]
-            self.push_screen(ActionMenu(f"{d} · {stat}", options), self._menu_choice)
+            sections = [("Reduce", [Entry(f"restore:{d}", f"Restore {d}"),
+                                    Entry(f"reduce:{d}", f"Statistic… ({stat})")]), self._plot_section()]
+            self.push_screen(ActionMenu(f"{d} · {stat}", sections), self._menu_choice)
             return
-        options: list[tuple[str, str]] = []
+        here: list[Entry] = []
+        view: list[Entry] = []
+        free = d in viewer.free_dims()
         if viewer.kind == "map":
-            if d != viewer.xdim:
-                options.append((f"x:{d}", "Put on the x axis (x)"))
-            if d != viewer.ydim:
-                options.append((f"y:{d}", "Put on the y axis (y)"))
-            role = viewer.role(d)
-            kind = "Vertical profile" if role == Z else "Time series" if role == TIME else "Line"
-            options.append((f"line:{d}", f"{kind} along {d} at the probe"))
-        options.append((f"reduce:{d}", f"Average over {d}…"))
-        if d in viewer.free_dims():
-            options.append((f"anim:{d}", f"Animate along {d} (space)"))
-            options.append((f"first:{d}", "Go to the first"))
-            options.append((f"last:{d}", "Go to the last"))
-        options.append(("goto", "Go to a value… (g)"))
-        self.push_screen(ActionMenu(f"{d}", options), self._menu_choice)
+            here.append(Entry(f"line:{d}", self._line_label(d)))
+            view += [Entry(f"x:{d}", "Put on the x axis", "x", enabled=d != viewer.xdim),
+                     Entry(f"y:{d}", "Put on the y axis", "y", enabled=d != viewer.ydim)]
+        view += [Entry(f"anim:{d}", f"Animate along {d}", "space", enabled=free),
+                 Entry(f"first:{d}", "Go to the first", "home", enabled=free),
+                 Entry(f"last:{d}", "Go to the last", "end", enabled=free),
+                 Entry("goto", "Go to a value…", "g")]
+        sections = [("Here", here), ("Reduce", [Entry(f"reduce:{d}", f"Reduce {d}…")]), ("View", view),
+                    self._plot_section()]
+        self.push_screen(ActionMenu(d, sections), self._menu_choice)
 
     def _menu_choice(self, choice: str | None) -> None:
         if not choice:
@@ -935,6 +944,10 @@ class NctuiApp(App):
                 self.view_changed()
         elif key == "reduce":
             self._statistic_menu(arg)
+        elif key == "reduce_pick":
+            self._reduce_pick_menu()
+        elif key == "centre_menu":
+            self._centre_menu()
         elif key == "stat":
             stat, _, dim = arg.partition(":")
             self.set_reduction(dim, stat)
