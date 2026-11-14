@@ -209,6 +209,23 @@ async def test_save_png(app, tmp_path):
         assert not isinstance(app.screen, SaveScreen)
 
 
+async def test_playback_tick_during_shutdown_is_harmless(app, monkeypatch):
+    """Textual removes the widgets before it stops the timers, so a playback tick can land in between."""
+    close_all = app._close_all
+
+    async def close_all_then_tick():
+        await close_all()
+        app._building = False
+        app._anim_tick()
+
+    monkeypatch.setattr(app, "_close_all", close_all_then_tick)
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        await pilot.press("space")
+        await pilot.pause()
+        assert app._anim_timer is not None
+
+
 async def test_save_animation_while_playing(app, tmp_path):
     """e during playback opens the dialog on animation, at the playback speed."""
     async with app.run_test(size=SIZE) as pilot:
