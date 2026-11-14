@@ -575,6 +575,8 @@ class NctuiApp(App):
         self._update_topbar()
 
     def _anim_tick(self) -> None:
+        if not self._running:
+            return  # shutting down: Textual removes the widgets before it stops this timer
         if self._building or self._output_behind():
             return  # skip a step rather than queue up frames the terminal hasn't drawn
         viewer = self.viewer
